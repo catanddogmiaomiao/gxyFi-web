@@ -1,0 +1,5 @@
+SESSION_SECRET=请换成至少32位的随机字符串
+# 最多 3 个账号。用 python scripts/hash_user.py 用户名 密码 生成每一项，再拼成 JSON 数组。
+AUTH_USERS=[]
+# 可选。不填时美股走 Yahoo Finance。
+# FINNHUB_TOKEN=

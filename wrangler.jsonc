@@ -1,0 +1,19 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "gxyfi-web",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-30",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "logs": { "enabled": true, "head_sampling_rate": 1 },
+    "traces": { "enabled": true, "head_sampling_rate": 1 }
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "gxyfi",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ]
+}

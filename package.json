@@ -1,0 +1,13 @@
+{
+  "name": "gxyfi-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "test": "node --test test/symbols.test.js",
+    "check": "wrangler deploy --dry-run"
+  },
+  "devDependencies": {
+    "wrangler": "^4.45.0"
+  }
+}
