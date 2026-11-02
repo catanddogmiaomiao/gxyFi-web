@@ -3,6 +3,7 @@ import { loadState, mutate, nowText } from "./data.js";
 import { workbook } from "./excel.js";
 import { PAGE } from "./page.js";
 import { refreshUserQuotes } from "./quotes.js";
+import { listTxns } from "./txns.js";
 
 const WINDOW_MS = 15 * 60 * 1000;
 
@@ -146,12 +147,18 @@ export default {
         return json(await loadState(env.DB, userId));
       }
       if (url.pathname === "/api/mutate" && request.method === "POST") {
+        let result;
         try {
-          await mutate(env.DB, userId, await request.json());
+          result = await mutate(env.DB, userId, await request.json());
         } catch (error) {
           return json({ error: clientError(error) }, 400);
         }
-        return json(await loadState(env.DB, userId));
+        const state = await loadState(env.DB, userId);
+        if (result) state.result = result;
+        return json(state);
+      }
+      if (url.pathname === "/api/txns" && request.method === "GET") {
+        return json({ txns: await listTxns(env.DB, userId, url.searchParams.get("account_id"), url.searchParams.get("limit")) });
       }
       if (url.pathname === "/api/quotes/refresh" && request.method === "POST") {
         const result = await refreshUserQuotes(env.DB, userId, env.FINNHUB_TOKEN || "");

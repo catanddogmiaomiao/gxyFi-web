@@ -2,7 +2,7 @@
 
 Cloudflare Worker 上的家庭资产台账。不开放注册，登录账号最多 3 个，密码只以 PBKDF2 摘要放在 Worker 密钥里，不进数据库，也不进 Git。
 
-这本云端账和 Windows 客户端 `gxyFi` 各自保存，目前不会自动同步。iPhone 以后可以调用同一组接口：登录后使用 Cookie，或请求头 `Authorization: Bearer <session>`。
+Windows 客户端 `gxyFi` 和 iPhone 客户端登录同一账号后共用这本账：每次修改都发到 `/api/mutate`，再用返回的整本账覆盖本机副本。客户端用请求头 `Authorization: Bearer <session>`，session 取自登录返回的 `gxyfi_session` Cookie。
 
 ## 接口
 

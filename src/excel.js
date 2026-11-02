@@ -32,6 +32,12 @@ export function workbook(state) {
       const quote = quotes.get(`${row.market}:${row.symbol}`);
       return [row.name, row.symbol, row.market, row.quantity, row.currency, row.avg_cost, row.manual_price, quote && quote.ok ? quote.price : "", quote ? quote.source : "", row.account_label, row.note];
     })),
+    sheet("基金定投", ["基金", "代码", "每期金额", "周期", "状态", "份额", "成本", "净值", "市值", "浮盈", "备注"], (state.dcaPlans || []).map((row) => [
+      row.name, row.symbol, row.amount, row.cycle_label, row.status, row.shares, row.cost, row.nav, row.market_value, row.pnl, row.note,
+    ])),
+    sheet("定投记录", ["基金编号", "类型", "确认日期", "金额", "确认净值", "确认份额", "手续费", "备注"], (state.dcaRecords || []).map((row) => [
+      row.plan_id, row.kind, row.trade_date, row.amount, row.nav, row.shares, row.fee, row.note,
+    ])),
     sheet("不动产", ["名称", "类型", "城市", "地址", "面积", "购入日", "购入价", "现值", "估值日", "贷款余额", "月租金", "备注"], state.properties.map((row) => [
       row.name, row.kind, row.city, row.address, row.area_sqm, row.acquired_on, row.purchase_price, row.current_value, row.valued_on, row.mortgage_balance, row.monthly_rent, row.note,
     ])),
@@ -43,7 +49,7 @@ export function workbook(state) {
     ])),
   ];
   const note = fx.USD ? `USD ${fx.USD.rate}` : "未设置美元汇率";
-  sheets.unshift(sheet("说明", ["项目", "内容"], [["导出", "gxyFi 网站台账"], ["汇率", note], ["声明", "行情只用于估值，有延迟，不构成投资建议。本表与 Windows 客户端不是同一本账。"]]));
+  sheets.unshift(sheet("说明", ["项目", "内容"], [["导出", "gxyFi 网站台账"], ["汇率", note], ["声明", "行情只用于估值，有延迟，不构成投资建议。Windows 客户端和 iPhone 登录同一账号时与本表是同一本账。"]]));
   return `<?xml version="1.0" encoding="UTF-8"?>
 <?mso-application progid="Excel.Sheet"?>
 <Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">

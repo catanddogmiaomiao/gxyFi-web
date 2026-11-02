@@ -1,0 +1,28 @@
+CREATE TABLE IF NOT EXISTS dca_plans (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  amount REAL NOT NULL,
+  cycle TEXT NOT NULL DEFAULT '每月',
+  debit_day INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT '进行中',
+  started_on TEXT,
+  manual_nav REAL,
+  note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS dca_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL,
+  plan_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  trade_date TEXT NOT NULL,
+  amount REAL NOT NULL DEFAULT 0,
+  nav REAL,
+  shares REAL NOT NULL DEFAULT 0,
+  fee REAL NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);

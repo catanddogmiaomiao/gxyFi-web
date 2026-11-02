@@ -9,6 +9,7 @@ export const PAGE = `<!DOCTYPE html>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body { margin: 0; background: #0c1016; color: #e7e1d6; font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif; }
+  [hidden] { display: none !important; }
   button, input, select { font: inherit; color: inherit; }
   button { cursor: pointer; }
   #login { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
@@ -54,7 +55,7 @@ export const PAGE = `<!DOCTYPE html>
 <div id="login">
   <form class="card" id="loginForm">
     <h1>gxyFi</h1>
-    <p class="sub">家庭资产台账。不开放注册，只有已经配置的账号可以进入，最多三个。这本云端账和 Windows 客户端各自保存，不会自动同步。</p>
+    <p class="sub">家庭资产台账。不开放注册，只有已经配置的账号可以进入，最多三个。Windows 客户端和 iPhone 登录同一个账号后，看到的是同一本账。</p>
     <label>账号</label>
     <input name="username" autocomplete="username" required>
     <label>密码</label>
@@ -226,6 +227,10 @@ function renderDash() {
     const cny = toCny(priced.price * holding.quantity, holding.currency);
     if (cny == null) missing = true; else invest += cny;
   });
+  (state.dcaPlans || []).forEach((plan) => {
+    if (Number(plan.shares) > 0 && plan.market_value == null) missing = true;
+    else if (plan.market_value != null) invest += Number(plan.market_value);
+  });
   state.properties.forEach((item) => {
     if (item.current_value == null) { missing = true; return; }
     property += Number(item.current_value) - Number(item.mortgage_balance || 0);
@@ -249,7 +254,7 @@ function renderAccounts() {
   const root = document.getElementById("accounts");
   root.replaceChildren();
   root.appendChild(el("h2", "储蓄"));
-  root.appendChild(el("p", "余额只来自手工录入。同一账户同一天再次保存会覆盖。", "hint"));
+  root.appendChild(el("p", "余额可以手工录入，也会由 Windows 客户端导入的交易明细自动生成（每月月末和最后一天）。同一账户同一天再次保存会覆盖。", "hint"));
   const form = document.createElement("form");
   form.className = "grid";
   field(form, "name", "账户名称");
@@ -288,15 +293,51 @@ function renderAccounts() {
   const rows = [];
   state.accounts.forEach((account) => {
     const balance = latestBalance(account.id);
-    rows.push([account.name, account.institution || "—", account.currency, balance ? money(balance.balance) : "—", balance ? balance.as_of_date : "—", removeButton("account", account.id)]);
+    const open = el("button", "明细");
+    open.type = "button";
+    open.className = "ghost";
+    open.addEventListener("click", () => { txnAccount = account.id; loadTxns().catch(showError); });
+    const source = balance && balance.source === "明细" ? "明细" : "手工";
+    rows.push([account.name, account.institution || "—", account.currency, balance ? money(balance.balance) : "—", balance ? balance.as_of_date + " · " + source : "—", open, removeButton("account", account.id)]);
   });
-  root.appendChild(table(["账户", "机构", "币种", "最近余额", "截止日期", ""], rows));
+  root.appendChild(table(["账户", "机构", "币种", "最近余额", "截止日期", "", ""], rows));
+  const box = el("div");
+  box.id = "txnBox";
+  root.appendChild(box);
+  if (txnAccount && state.accounts.some((account) => account.id === txnAccount)) loadTxns().catch(showError);
+}
+let txnAccount = null;
+async function loadTxns() {
+  const response = await fetch("/api/txns?limit=300&account_id=" + encodeURIComponent(txnAccount), { credentials: "same-origin" });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error || "读取明细失败");
+  const box = document.getElementById("txnBox");
+  if (!box) return;
+  const account = state.accounts.find((item) => item.id === txnAccount);
+  box.replaceChildren();
+  const title = el("h2", "「" + (account ? account.name : "") + "」交易明细");
+  title.style.marginTop = "24px";
+  box.appendChild(title);
+  const list = payload.txns || [];
+  box.appendChild(el("p", list.length ? "显示最近 " + list.length + " 笔。导入和批量修改请用 Windows 客户端的「储蓄 → 导入明细」。删除后余额会自动重算。" : "这个账户还没有明细。在 Windows 客户端「储蓄」页选中账户，点「导入明细」。", "hint"));
+  if (!list.length) return;
+  box.appendChild(table(["日期", "时间", "收入", "支出", "交易后余额", "对方户名", "摘要", ""], list.map((row) => {
+    const amount = Number(row.amount);
+    const button = el("button", "删除");
+    button.type = "button";
+    button.className = "danger";
+    button.addEventListener("click", () => {
+      if (!window.confirm("删除这笔明细？余额会随之重算。")) return;
+      post("/api/mutate", { entity: "txn", op: "delete", data: { ids: [row.id] } }).then(refreshState).catch(showError);
+    });
+    return [row.txn_date, row.txn_time, amount > 0 ? money(amount) : "", amount < 0 ? money(-amount) : "", row.balance == null ? "" : money(row.balance), row.counterparty, row.summary, button];
+  })));
 }
 function renderInvest() {
   const root = document.getElementById("invest");
   root.replaceChildren();
   root.appendChild(el("h2", "投资"));
-  root.appendChild(el("p", "黄金按克填写，Au(T+D) 的行情是人民币/克。刷新只查询已有持仓，最多 30 个代码。", "hint"));
+  root.appendChild(el("p", "股票和黄金记在上面。基金定投记在下面：只知道当前份额时记一笔期初；要留下每期扣款，逐笔记录或粘贴历史。同一只基金不要在两处各记一份份额。", "hint"));
   const fx = document.createElement("form");
   fx.className = "grid";
   field(fx, "code", [["美元", "USD"], ["港币", "HKD"]], "select");
@@ -333,6 +374,76 @@ function renderInvest() {
     return [holding.name, holding.symbol, holding.market, String(holding.quantity), priced.price == null ? "—" : money(priced.price), cny == null ? "—" : money(cny), priced.source || "—", removeButton("holding", holding.id)];
   });
   root.appendChild(table(["名称", "代码", "市场", "数量", "现价", "市值¥", "来源", ""], rows));
+  root.appendChild(el("h2", "基金定投"));
+  const plans = state.dcaPlans || [];
+  const planChoices = plans.map((plan) => [plan.name + " " + plan.symbol, String(plan.id)]);
+  const planForm = document.createElement("form");
+  planForm.className = "grid";
+  field(planForm, "name", "基金名称");
+  field(planForm, "symbol", "6 位基金代码");
+  field(planForm, "amount", "每期金额");
+  field(planForm, "cycle", [["每月", "每月"], ["每周", "每周"], ["每两周", "每两周"]], "select");
+  field(planForm, "debit_day", "扣款日：每月 1-28，每周 1-5");
+  field(planForm, "status", [["进行中", "进行中"], ["已暂停", "已暂停"], ["已结束", "已结束"]], "select");
+  field(planForm, "manual_nav", "最新净值，可留空");
+  const planButton = el("button", "新增计划");
+  planButton.className = "primary";
+  planForm.appendChild(planButton);
+  planForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try { await save("dca_plan", Object.fromEntries(new FormData(planForm))); planForm.reset(); }
+    catch (error) { showError(error); }
+  });
+  root.appendChild(planForm);
+  const planRows = plans.map((plan) => [
+    plan.name, plan.symbol, money(plan.amount), plan.cycle_label, plan.status, String(plan.shares),
+    money(plan.cost), plan.nav == null ? "—" : String(plan.nav), plan.market_value == null ? "—" : money(plan.market_value),
+    plan.pnl == null ? "—" : money(plan.pnl), removeButton("dca_plan", plan.id),
+  ]);
+  root.appendChild(table(["基金", "代码", "每期", "周期", "状态", "份额", "成本", "净值", "市值", "浮盈", ""], planRows));
+  if (!planChoices.length) return;
+  const recordForm = document.createElement("form");
+  recordForm.className = "grid";
+  field(recordForm, "plan_id", planChoices, "select");
+  field(recordForm, "kind", [["定投", "定投"], ["期初", "期初"], ["赎回", "赎回"], ["红利再投", "红利再投"]], "select");
+  field(recordForm, "trade_date", "确认日期 YYYY-MM-DD");
+  field(recordForm, "amount", "金额");
+  field(recordForm, "nav", "确认净值，定投可用来推算份额");
+  field(recordForm, "shares", "确认份额，定投可留空");
+  field(recordForm, "fee", "手续费，可留空");
+  const recordButton = el("button", "记一笔");
+  recordButton.className = "primary";
+  recordForm.appendChild(recordButton);
+  recordForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try { await save("dca_record", Object.fromEntries(new FormData(recordForm))); }
+    catch (error) { showError(error); }
+  });
+  root.appendChild(recordForm);
+  const names = Object.fromEntries(plans.map((plan) => [plan.id, plan.name]));
+  const recordRows = (state.dcaRecords || []).map((row) => [
+    names[row.plan_id] || "—", row.trade_date, row.kind, money(row.amount), row.nav == null ? "—" : String(row.nav),
+    String(row.shares), money(row.fee), row.note || "—", removeButton("dca_record", row.id),
+  ]);
+  root.appendChild(table(["基金", "日期", "类型", "金额", "净值", "份额", "手续费", "备注", ""], recordRows));
+  const importForm = document.createElement("form");
+  importForm.className = "grid";
+  field(importForm, "plan_id", planChoices, "select");
+  const paste = document.createElement("textarea");
+  paste.name = "text";
+  paste.rows = 6;
+  paste.placeholder = "每行一条：确认日期,类型,扣款金额,确认净值,确认份额,手续费,备注。第一行可以是表头。定投份额可留空。";
+  paste.style.gridColumn = "1 / -1";
+  importForm.appendChild(paste);
+  const importButton = el("button", "导入历史");
+  importButton.className = "ghost";
+  importForm.appendChild(importButton);
+  importForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try { await save("dca_import", Object.fromEntries(new FormData(importForm))); paste.value = ""; }
+    catch (error) { showError(error); }
+  });
+  root.appendChild(importForm);
 }
 function renderProperty() {
   const root = document.getElementById("property");

@@ -1,3 +1,8 @@
+import { applyPosition, normalizeRecord, parseImport, planFields, valuePlans } from "./dca.js";
+import { mutateTxns, txnRev, unlinkAccount } from "./txns.js";
+
+const TXN_ENTITIES = new Set(["account_map", "txn_import", "txn", "txn_batch", "txn_classify", "txn_rule"]);
+
 const CATEGORIES = ["居住", "餐饮", "交通", "教育", "医疗", "保险", "日用", "人情", "娱乐", "其他"];
 const KINDS = ["现金", "活期", "定期", "货币基金", "公积金", "其他"];
 const PROPERTY_KINDS = ["住宅", "商铺", "车位", "土地", "其他"];
@@ -76,9 +81,13 @@ export async function mutate(db, userId, body) {
   const id = body?.id;
   const stamp = nowText();
 
+  if (TXN_ENTITIES.has(entity)) return mutateTxns(db, userId, entity, op, data, id);
+
   if (entity === "account") {
     if (op === "delete") {
       await owned(db, "SELECT id FROM accounts WHERE user_id=? AND id=?", userId, id);
+      await db.batch(unlinkAccount(db, userId, Number(id)));
+      await db.prepare("DELETE FROM account_txns WHERE user_id=? AND account_id=?").bind(userId, id).run();
       await db.prepare("DELETE FROM balance_entries WHERE user_id=? AND account_id=?").bind(userId, id).run();
       await db.prepare("DELETE FROM accounts WHERE user_id=? AND id=?").bind(userId, id).run();
       return;
@@ -111,9 +120,9 @@ export async function mutate(db, userId, body) {
     const balance = money(data.balance, "余额", { required: true, allowNegative: true });
     const note = text(data.note, 300);
     await db.prepare(
-      `INSERT INTO balance_entries(user_id, account_id, as_of_date, balance, note, created_at)
-       VALUES(?,?,?,?,?,?)
-       ON CONFLICT(user_id, account_id, as_of_date) DO UPDATE SET balance=excluded.balance, note=excluded.note`,
+      `INSERT INTO balance_entries(user_id, account_id, as_of_date, balance, note, source, created_at)
+       VALUES(?,?,?,?,?,'手工',?)
+       ON CONFLICT(user_id, account_id, as_of_date) DO UPDATE SET balance=excluded.balance, note=excluded.note, source='手工'`,
     ).bind(userId, accountId, asOf, balance, note, stamp).run();
     return;
   }
@@ -187,16 +196,22 @@ export async function mutate(db, userId, body) {
 
   if (entity === "expense") {
     if (op === "delete") {
-      await owned(db, "SELECT id FROM expenses WHERE user_id=? AND id=?", userId, id);
+      const current = await owned(db, "SELECT id, txn_id FROM expenses WHERE user_id=? AND id=?", userId, id);
       await db.prepare("DELETE FROM expenses WHERE user_id=? AND id=?").bind(userId, id).run();
+      if (current.txn_id) {
+        await db.prepare("UPDATE account_txns SET treat='不计', category_id=NULL, updated_at=? WHERE user_id=? AND id=?").bind(stamp, userId, current.txn_id).run();
+      }
       return;
     }
     const categoryId = Number(data.category_id);
     await owned(db, "SELECT id FROM expense_categories WHERE user_id=? AND id=?", userId, categoryId);
     const fields = [categoryId, day(data.occurred_on, "日期", true), money(data.amount, "金额", { required: true, allowZero: false }), text(data.payee, 80), text(data.note, 300)];
     if (op === "update") {
-      await owned(db, "SELECT id FROM expenses WHERE user_id=? AND id=?", userId, id);
+      const current = await owned(db, "SELECT id, txn_id FROM expenses WHERE user_id=? AND id=?", userId, id);
       await db.prepare("UPDATE expenses SET category_id=?, occurred_on=?, amount=?, payee=?, note=? WHERE user_id=? AND id=?").bind(...fields, userId, id).run();
+      if (current.txn_id) {
+        await db.prepare("UPDATE account_txns SET category_id=?, updated_at=? WHERE user_id=? AND id=?").bind(categoryId, stamp, userId, current.txn_id).run();
+      }
       return;
     }
     await db.prepare("INSERT INTO expenses(user_id, category_id, occurred_on, amount, payee, note, created_at) VALUES(?,?,?,?,?,?,?)").bind(userId, ...fields, stamp).run();
@@ -217,6 +232,67 @@ export async function mutate(db, userId, body) {
     return;
   }
 
+  if (entity === "dca_plan") {
+    if (op === "delete") {
+      await owned(db, "SELECT id FROM dca_plans WHERE user_id=? AND id=?", userId, id);
+      await db.prepare("DELETE FROM dca_records WHERE user_id=? AND plan_id=?").bind(userId, id).run();
+      await db.prepare("DELETE FROM dca_plans WHERE user_id=? AND id=?").bind(userId, id).run();
+      return;
+    }
+    const fields = planFields(data);
+    if (op === "update") {
+      await owned(db, "SELECT id FROM dca_plans WHERE user_id=? AND id=?", userId, id);
+      await db.prepare("UPDATE dca_plans SET name=?, symbol=?, amount=?, cycle=?, debit_day=?, status=?, started_on=?, manual_nav=?, note=? WHERE user_id=? AND id=?").bind(...fields, userId, id).run();
+      return;
+    }
+    await db.prepare("INSERT INTO dca_plans(user_id, name, symbol, amount, cycle, debit_day, status, started_on, manual_nav, note, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)").bind(userId, ...fields, stamp).run();
+    return;
+  }
+
+  if (entity === "dca_record" || entity === "dca_import") {
+    const planId = Number(data.plan_id || 0);
+    if (entity === "dca_record" && op === "delete") {
+      const current = await owned(db, "SELECT * FROM dca_records WHERE user_id=? AND id=?", userId, id);
+      const existing = (await db.prepare("SELECT * FROM dca_records WHERE user_id=? AND plan_id=? ORDER BY trade_date, id").bind(userId, current.plan_id).all()).results;
+      applyPosition(existing.filter((row) => row.id !== Number(id)));
+      await db.prepare("DELETE FROM dca_records WHERE user_id=? AND id=?").bind(userId, id).run();
+      return;
+    }
+    await owned(db, "SELECT id FROM dca_plans WHERE user_id=? AND id=?", userId, planId);
+    const existing = (await db.prepare("SELECT * FROM dca_records WHERE user_id=? AND plan_id=? ORDER BY trade_date, id").bind(userId, planId).all()).results;
+    if (entity === "dca_import") {
+      const incoming = parseImport(data.text);
+      applyPosition(existing.concat(incoming.map((row, index) => ({ ...row, id: 10 ** 12 + index }))));
+      for (const row of incoming) {
+        await db.prepare("INSERT INTO dca_records(user_id, plan_id, kind, trade_date, amount, nav, shares, fee, note, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)").bind(
+          userId, planId, row.kind, row.trade_date, row.amount, row.nav, row.shares, row.fee, row.note, stamp,
+        ).run();
+      }
+      return;
+    }
+    const normalized = normalizeRecord(data);
+    const draft = [];
+    let replaced = op !== "update";
+    for (const row of existing) {
+      if (op === "update" && row.id === Number(id)) {
+        draft.push({ ...normalized, id: Number(id) });
+        replaced = true;
+      } else {
+        draft.push(row);
+      }
+    }
+    if (op === "update" && !replaced) throw new Error("记录不存在");
+    if (op !== "update") draft.push({ ...normalized, id: 10 ** 12 });
+    applyPosition(draft);
+    const fields = [planId, normalized.kind, normalized.trade_date, normalized.amount, normalized.nav, normalized.shares, normalized.fee, normalized.note];
+    if (op === "update") {
+      await db.prepare("UPDATE dca_records SET plan_id=?, kind=?, trade_date=?, amount=?, nav=?, shares=?, fee=?, note=? WHERE user_id=? AND id=?").bind(...fields, userId, id).run();
+      return;
+    }
+    await db.prepare("INSERT INTO dca_records(user_id, plan_id, kind, trade_date, amount, nav, shares, fee, note, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)").bind(userId, ...fields, stamp).run();
+    return;
+  }
+
   if (entity === "fx") {
     const code = oneOf(data.code, ["USD", "HKD"]);
     const rate = money(data.rate, "汇率", { required: true, allowZero: false });
@@ -234,6 +310,8 @@ export async function mutate(db, userId, body) {
 export async function loadState(db, userId) {
   await ensureCategories(db, userId);
   const all = async (sql) => (await db.prepare(sql).bind(userId).all()).results;
+  const dcaRecords = await all("SELECT * FROM dca_records WHERE user_id=? ORDER BY trade_date, id");
+  const dcaPlans = valuePlans(await all("SELECT * FROM dca_plans WHERE user_id=? ORDER BY status, symbol, id"), dcaRecords);
   return {
     accounts: await all("SELECT * FROM accounts WHERE user_id=? ORDER BY id"),
     balances: await all("SELECT * FROM balance_entries WHERE user_id=? ORDER BY as_of_date DESC, id DESC"),
@@ -248,5 +326,9 @@ export async function loadState(db, userId) {
     ),
     budgets: await all("SELECT * FROM budget_lines WHERE user_id=? ORDER BY year, category_id"),
     fx: await all("SELECT * FROM fx_rates WHERE user_id=? ORDER BY code"),
+    dcaPlans,
+    dcaRecords,
+    txnRules: await all("SELECT id, field, keyword, treat, category_id, created_at FROM txn_rules WHERE user_id=? ORDER BY id"),
+    txnRev: await txnRev(db, userId),
   };
 }
