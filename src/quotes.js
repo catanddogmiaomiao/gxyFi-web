@@ -60,6 +60,16 @@ function parseSge(obj) {
   };
 }
 
+function previousCloseFromYahoo(result, meta) {
+  // chartPreviousClose 在 range=5d 时经常不是上一交易日收盘价，会把当日涨跌算错。
+  for (const key of ["previousClose", "regularMarketPreviousClose"]) {
+    if (meta[key] != null && meta[key] !== "") return Number(meta[key]);
+  }
+  const closes = ((((result.indicators || {}).quote || [])[0] || {}).close || []).filter((item) => item != null).map(Number);
+  if (closes.length >= 2) return closes[closes.length - 2];
+  return meta.chartPreviousClose == null || meta.chartPreviousClose === "" ? null : Number(meta.chartPreviousClose);
+}
+
 function parseYahoo(obj) {
   const result = obj.chart && obj.chart.result && obj.chart.result[0];
   if (!result) throw new Error("Yahoo 没有返回行情");
@@ -70,7 +80,7 @@ function parseYahoo(obj) {
   return {
     name: meta.shortName || meta.symbol || "",
     price: Number(meta.regularMarketPrice),
-    prev_close: meta.chartPreviousClose == null ? null : Number(meta.chartPreviousClose),
+    prev_close: previousCloseFromYahoo(result, meta),
     currency: meta.currency || "",
     quoted_at: quoted,
   };

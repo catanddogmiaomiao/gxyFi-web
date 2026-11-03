@@ -15,6 +15,7 @@ test("明细生成每月月末和最后一天的余额", () => {
     { txn_date: "2026-10-02", amount: -35, balance: null },
   ];
   assert.deepEqual(snapshotPoints(noBalance, 1000), [["2026-10-02", 1465]]);
+  assert.deepEqual(snapshotPoints(noBalance, 0, [["2026-09-30", -1000]]), [["2026-10-02", -535]]);
   assert.deepEqual(snapshotPoints([], 0), []);
 });
 

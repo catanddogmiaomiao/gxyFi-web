@@ -45,19 +45,33 @@ export function txnFields(data) {
   };
 }
 
-export function dailyBalances(txns, opening) {
+export function dailyBalances(txns, opening, anchors = []) {
+  const anchorAt = new Map();
+  for (const [day, balance] of anchors) anchorAt.set(day, Number(balance));
+  const byDay = new Map();
+  for (const row of txns) {
+    if (!byDay.has(row.txn_date)) byDay.set(row.txn_date, []);
+    byDay.get(row.txn_date).push(row);
+  }
   let running = Number(opening || 0);
   const out = new Map();
-  for (const row of txns) {
-    if (row.balance != null) running = Number(row.balance);
-    else running = Math.round((running + Number(row.amount)) * 100) / 100;
-    out.set(row.txn_date, Math.round(running * 100) / 100);
+  const days = [...new Set([...byDay.keys(), ...anchorAt.keys()])].sort();
+  for (const day of days) {
+    const rows = byDay.get(day) || [];
+    if (anchorAt.has(day) && rows.every((row) => row.balance == null)) running = anchorAt.get(day);
+    else {
+      for (const row of rows) {
+        if (row.balance != null) running = Number(row.balance);
+        else running = Math.round((running + Number(row.amount)) * 100) / 100;
+      }
+    }
+    if (rows.length) out.set(day, Math.round(running * 100) / 100);
   }
   return out;
 }
 
-export function snapshotPoints(txns, opening) {
-  const daily = dailyBalances(txns, opening);
+export function snapshotPoints(txns, opening, anchors = []) {
+  const daily = dailyBalances(txns, opening, anchors);
   if (!daily.size) return [];
   const days = [...daily.keys()].sort();
   const picks = new Map();
@@ -86,11 +100,17 @@ export async function rebuildBalances(db, userId, accountId) {
   const txns = (await db.prepare(
     "SELECT txn_date, amount, balance FROM account_txns WHERE user_id=? AND account_id=? ORDER BY txn_date, txn_time, id",
   ).bind(userId, owner.id).all()).results;
+  const manuals = (await db.prepare(
+    "SELECT as_of_date, balance FROM balance_entries WHERE user_id=? AND account_id=? AND source!='明细' ORDER BY as_of_date, id",
+  ).bind(userId, owner.id).all()).results;
+  const anchors = manuals.map((row) => [row.as_of_date, row.balance]);
+  const manualDates = new Set(manuals.map((row) => row.as_of_date));
   const stamp = nowText();
   const statements = [
     db.prepare("DELETE FROM balance_entries WHERE user_id=? AND account_id=? AND source='明细'").bind(userId, owner.id),
   ];
-  for (const [asOf, balance] of snapshotPoints(txns, openingOf(owner))) {
+  for (const [asOf, balance] of snapshotPoints(txns, openingOf(owner), anchors)) {
+    if (manualDates.has(asOf)) continue;
     statements.push(db.prepare(
       `INSERT INTO balance_entries(user_id, account_id, as_of_date, balance, note, source, created_at)
        VALUES(?,?,?,?,?,?,?)

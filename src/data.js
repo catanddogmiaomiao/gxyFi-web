@@ -1,5 +1,5 @@
 import { applyPosition, normalizeRecord, parseImport, planFields, valuePlans } from "./dca.js";
-import { mutateTxns, txnRev, unlinkAccount } from "./txns.js";
+import { mutateTxns, rebuildBalances, txnRev, unlinkAccount } from "./txns.js";
 
 const TXN_ENTITIES = new Set(["account_map", "txn_import", "txn", "txn_batch", "txn_classify", "txn_rule"]);
 
@@ -110,8 +110,10 @@ export async function mutate(db, userId, body) {
 
   if (entity === "balance") {
     if (op === "delete") {
-      await owned(db, "SELECT id FROM balance_entries WHERE user_id=? AND id=?", userId, id);
+      const row = await db.prepare("SELECT account_id FROM balance_entries WHERE user_id=? AND id=?").bind(userId, id).first();
+      if (!row) throw new Error("记录不存在");
       await db.prepare("DELETE FROM balance_entries WHERE user_id=? AND id=?").bind(userId, id).run();
+      await rebuildBalances(db, userId, row.account_id);
       return;
     }
     const accountId = Number(data.account_id);
@@ -124,6 +126,7 @@ export async function mutate(db, userId, body) {
        VALUES(?,?,?,?,?,'手工',?)
        ON CONFLICT(user_id, account_id, as_of_date) DO UPDATE SET balance=excluded.balance, note=excluded.note, source='手工'`,
     ).bind(userId, accountId, asOf, balance, note, stamp).run();
+    await rebuildBalances(db, userId, accountId);
     return;
   }
 

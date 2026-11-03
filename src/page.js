@@ -368,12 +368,31 @@ function renderInvest() {
     catch (error) { showError(error); }
   });
   root.appendChild(form);
-  const rows = state.holdings.map((holding) => {
+  const valued = state.holdings.map((holding) => {
     const priced = priceOf(holding);
-    const cny = priced.price == null ? null : toCny(priced.price * holding.quantity, holding.currency);
-    return [holding.name, holding.symbol, holding.market, String(holding.quantity), priced.price == null ? "—" : money(priced.price), cny == null ? "—" : money(cny), priced.source || "—", removeButton("holding", holding.id)];
+    const quantity = Number(holding.quantity);
+    const avg = holding.avg_cost == null || holding.avg_cost === "" ? null : Number(holding.avg_cost);
+    const value = priced.price == null ? null : toCny(priced.price * quantity, holding.currency);
+    const cost = avg == null ? null : toCny(avg * quantity, holding.currency);
+    const ret = priced.price == null || !avg ? null : priced.price / avg - 1;
+    return { holding, priced, avg, value, cost, pnl: value == null || cost == null ? null : value - cost, ret };
   });
-  root.appendChild(table(["名称", "代码", "市场", "数量", "现价", "市值¥", "来源", ""], rows));
+  const totalValue = valued.reduce((sum, row) => sum + (row.value || 0), 0);
+  const pct = (value) => value == null ? "—" : (value * 100).toFixed(1) + "%";
+  const rows = valued.map((row) => [
+    row.holding.name, row.holding.symbol, row.holding.market, String(row.holding.quantity),
+    row.avg == null ? "未填" : money(row.avg), row.priced.price == null ? "—" : money(row.priced.price),
+    pct(row.ret), row.cost == null ? "—" : money(row.cost), row.value == null ? "—" : money(row.value),
+    row.pnl == null ? "—" : money(row.pnl), row.value == null || !totalValue ? "—" : pct(row.value / totalValue),
+    row.priced.source || "—", removeButton("holding", row.holding.id),
+  ]);
+  const withCost = valued.filter((row) => row.value != null && row.cost != null);
+  if (valued.length) {
+    const cost = withCost.reduce((sum, row) => sum + row.cost, 0);
+    const pnl = withCost.reduce((sum, row) => sum + row.value, 0) - cost;
+    root.appendChild(el("p", "市值 ¥" + money(totalValue) + " · 成本 ¥" + money(cost) + " · 浮盈 ¥" + money(pnl) + "（" + pct(cost ? pnl / cost : null) + "）。收益率按原币计算，成本、市值、浮盈按当前汇率折成人民币。", "hint"));
+  }
+  root.appendChild(table(["名称", "代码", "市场", "数量", "成本价", "现价", "收益率", "成本¥", "市值¥", "浮盈¥", "占比", "来源", ""], rows));
   root.appendChild(el("h2", "基金定投"));
   const plans = state.dcaPlans || [];
   const planChoices = plans.map((plan) => [plan.name + " " + plan.symbol, String(plan.id)]);
