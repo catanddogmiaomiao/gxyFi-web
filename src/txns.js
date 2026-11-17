@@ -127,15 +127,17 @@ function mapText(map) {
   return text;
 }
 
-const TREATS = new Set(["", "支出", "退款", "不计", "转账"]);
-const RULE_TREATS = new Set(["支出", "退款", "不计"]);
+const TREATS = new Set(["", "支出", "退款", "收入", "不计", "转账"]);
+const RULE_TREATS = new Set(["支出", "退款", "收入", "不计"]);
 const RULE_FIELDS = new Set(["counterparty", "summary"]);
 
-// 明细删掉时：由明细生成的支出一起删；合并过的手工支出只解除关联。
+// 明细删掉时：由明细生成的支出/收入一起删；合并过的手工记录只解除关联。
 function unlinkStatements(db, userId, where, args) {
   return [
     db.prepare(`DELETE FROM expenses WHERE user_id=? AND source='明细' AND txn_id IN (SELECT id FROM account_txns WHERE user_id=? AND ${where})`).bind(userId, userId, ...args),
     db.prepare(`UPDATE expenses SET txn_id=NULL WHERE user_id=? AND txn_id IN (SELECT id FROM account_txns WHERE user_id=? AND ${where})`).bind(userId, userId, ...args),
+    db.prepare(`DELETE FROM incomes WHERE user_id=? AND source='明细' AND txn_id IN (SELECT id FROM account_txns WHERE user_id=? AND ${where})`).bind(userId, userId, ...args),
+    db.prepare(`UPDATE incomes SET txn_id=NULL WHERE user_id=? AND txn_id IN (SELECT id FROM account_txns WHERE user_id=? AND ${where})`).bind(userId, userId, ...args),
   ];
 }
 
@@ -149,10 +151,18 @@ function expensePayload(txn, treat) {
   return { amount: Math.round(-Number(txn.amount) * 100) / 100, payee, note };
 }
 
+function incomePayload(txn) {
+  const payee = (txn.counterparty || txn.summary || "").slice(0, 80);
+  return { amount: Math.round(Number(txn.amount) * 100) / 100, payee, note: (txn.summary || "").slice(0, 300) };
+}
+
 async function classify(db, userId, data, stamp) {
   const items = Array.isArray(data.items) ? data.items : [];
   if (items.length > 500) throw new Error("一次最多归类 500 笔");
-  const categories = new Set((await db.prepare("SELECT id FROM expense_categories WHERE user_id=?").bind(userId).all()).results.map((row) => row.id));
+  const expenseRows = (await db.prepare("SELECT id, active FROM expense_categories WHERE user_id=?").bind(userId).all()).results;
+  const incomeRows = (await db.prepare("SELECT id, active FROM income_categories WHERE user_id=?").bind(userId).all()).results;
+  const expenseActive = new Set(expenseRows.filter((row) => row.active !== 0).map((row) => row.id));
+  const incomeActive = new Set(incomeRows.filter((row) => row.active !== 0).map((row) => row.id));
   const ids = items.map((item) => Number(item.id));
   const txns = new Map();
   for (let start = 0; start < ids.length; start += 90) {
@@ -160,15 +170,23 @@ async function classify(db, userId, data, stamp) {
     const marks = part.map(() => "?").join(",");
     (await db.prepare(`SELECT * FROM account_txns WHERE user_id=? AND id IN (${marks})`).bind(userId, ...part).all()).results.forEach((row) => txns.set(row.id, row));
   }
-  const mergeIds = items.map((item) => Number(item.expense_id || 0)).filter(Boolean);
-  const manual = new Map();
-  for (let start = 0; start < mergeIds.length; start += 90) {
-    const part = mergeIds.slice(start, start + 90);
+  const mergeExpenseIds = items.map((item) => Number(item.expense_id || 0)).filter(Boolean);
+  const mergeIncomeIds = items.map((item) => Number(item.income_id || 0)).filter(Boolean);
+  const manualExpenses = new Map();
+  const manualIncomes = new Map();
+  for (let start = 0; start < mergeExpenseIds.length; start += 90) {
+    const part = mergeExpenseIds.slice(start, start + 90);
     const marks = part.map(() => "?").join(",");
-    (await db.prepare(`SELECT id, category_id, txn_id FROM expenses WHERE user_id=? AND id IN (${marks})`).bind(userId, ...part).all()).results.forEach((row) => manual.set(row.id, row));
+    (await db.prepare(`SELECT id, category_id, txn_id FROM expenses WHERE user_id=? AND id IN (${marks})`).bind(userId, ...part).all()).results.forEach((row) => manualExpenses.set(row.id, row));
+  }
+  for (let start = 0; start < mergeIncomeIds.length; start += 90) {
+    const part = mergeIncomeIds.slice(start, start + 90);
+    const marks = part.map(() => "?").join(",");
+    (await db.prepare(`SELECT id, category_id, txn_id FROM incomes WHERE user_id=? AND id IN (${marks})`).bind(userId, ...part).all()).results.forEach((row) => manualIncomes.set(row.id, row));
   }
   const statements = [];
-  const used = new Set();
+  const usedExpenses = new Set();
+  const usedIncomes = new Set();
   for (const item of items) {
     const treat = String(item.treat ?? "");
     if (!TREATS.has(treat)) throw new Error("归类无效");
@@ -176,21 +194,36 @@ async function classify(db, userId, data, stamp) {
     if (!txn) throw new Error("明细不存在");
     if (treat === "支出" && Number(txn.amount) >= 0) throw new Error("收入不能归为支出");
     if (treat === "退款" && Number(txn.amount) <= 0) throw new Error("只有收入能记为退款");
+    if (treat === "收入" && Number(txn.amount) <= 0) throw new Error("只有收入明细能归为收入");
     statements.push(...unlinkStatements(db, userId, "id=?", [txn.id]));
     let categoryId = null;
-    const mergeId = Number(item.expense_id || 0);
-    if (treat === "支出" && mergeId) {
-      const target = manual.get(mergeId);
-      if (!target || (target.txn_id && target.txn_id !== txn.id) || used.has(mergeId)) throw new Error("要合并的手工支出不存在或已经合并过");
-      used.add(mergeId);
+    const mergeExpense = Number(item.expense_id || 0);
+    const mergeIncome = Number(item.income_id || 0);
+    if (treat === "支出" && mergeExpense) {
+      const target = manualExpenses.get(mergeExpense);
+      if (!target || (target.txn_id && target.txn_id !== txn.id) || usedExpenses.has(mergeExpense)) throw new Error("要合并的手工支出不存在或已经合并过");
+      usedExpenses.add(mergeExpense);
       categoryId = target.category_id;
-      statements.push(db.prepare("UPDATE expenses SET txn_id=? WHERE user_id=? AND id=?").bind(txn.id, userId, mergeId));
+      statements.push(db.prepare("UPDATE expenses SET txn_id=? WHERE user_id=? AND id=?").bind(txn.id, userId, mergeExpense));
+    } else if (treat === "收入" && mergeIncome) {
+      const target = manualIncomes.get(mergeIncome);
+      if (!target || (target.txn_id && target.txn_id !== txn.id) || usedIncomes.has(mergeIncome)) throw new Error("要合并的手工收入不存在或已经合并过");
+      usedIncomes.add(mergeIncome);
+      categoryId = target.category_id;
+      statements.push(db.prepare("UPDATE incomes SET txn_id=? WHERE user_id=? AND id=?").bind(txn.id, userId, mergeIncome));
     } else if (treat === "支出" || treat === "退款") {
       categoryId = Number(item.category_id);
-      if (!categories.has(categoryId)) throw new Error("请选择支出类别");
+      if (!expenseActive.has(categoryId)) throw new Error("这个支出类别已停用，请改到在用的类别");
       const payload = expensePayload(txn, treat);
       statements.push(db.prepare(
         "INSERT INTO expenses(user_id, category_id, occurred_on, amount, payee, note, source, txn_id, created_at) VALUES(?,?,?,?,?,?,'明细',?,?)",
+      ).bind(userId, categoryId, txn.txn_date, payload.amount, payload.payee, payload.note, txn.id, stamp));
+    } else if (treat === "收入") {
+      categoryId = Number(item.category_id);
+      if (!incomeActive.has(categoryId)) throw new Error("这个收入类别已停用，请改到在用的类别");
+      const payload = incomePayload(txn);
+      statements.push(db.prepare(
+        "INSERT INTO incomes(user_id, category_id, occurred_on, amount, payee, note, source, txn_id, created_at) VALUES(?,?,?,?,?,?,'明细',?,?)",
       ).bind(userId, categoryId, txn.txn_date, payload.amount, payload.payee, payload.note, txn.id, stamp));
     }
     statements.push(db.prepare("UPDATE account_txns SET treat=?, category_id=?, updated_at=? WHERE user_id=? AND id=?").bind(treat, categoryId, stamp, userId, txn.id));
@@ -202,7 +235,8 @@ async function classify(db, userId, data, stamp) {
     const treat = String(rule.treat || "");
     if (!RULE_FIELDS.has(field) || !keyword || !RULE_TREATS.has(treat)) continue;
     const categoryId = treat === "不计" ? null : Number(rule.category_id);
-    if (treat !== "不计" && !categories.has(categoryId)) continue;
+    const active = treat === "收入" ? incomeActive : expenseActive;
+    if (treat !== "不计" && !active.has(categoryId)) continue;
     statements.push(db.prepare(
       `INSERT INTO txn_rules(user_id, field, keyword, treat, category_id, created_at) VALUES(?,?,?,?,?,?)
        ON CONFLICT(user_id, field, keyword) DO UPDATE SET treat=excluded.treat, category_id=excluded.category_id`,
@@ -287,9 +321,15 @@ export async function mutateTxns(db, userId, entity, op, data, id) {
         "UPDATE account_txns SET txn_date=?, txn_time=?, amount=?, balance=?, counterparty=?, summary=?, note=?, updated_at=? WHERE user_id=? AND id=?",
       ).bind(fields.txn_date, fields.txn_time, fields.amount, fields.balance, fields.counterparty, fields.summary, fields.note, stamp, userId, Number(id)).run();
       const updated = await db.prepare("SELECT * FROM account_txns WHERE user_id=? AND id=?").bind(userId, Number(id)).first();
-      const payload = expensePayload(updated, updated.treat);
-      await db.prepare("UPDATE expenses SET occurred_on=?, amount=?, payee=? WHERE user_id=? AND txn_id=? AND source='明细'")
-        .bind(updated.txn_date, payload.amount, payload.payee, userId, updated.id).run();
+      if (updated.treat === "支出" || updated.treat === "退款") {
+        const payload = expensePayload(updated, updated.treat);
+        await db.prepare("UPDATE expenses SET occurred_on=?, amount=?, payee=? WHERE user_id=? AND txn_id=? AND source='明细'")
+          .bind(updated.txn_date, payload.amount, payload.payee, userId, updated.id).run();
+      } else if (updated.treat === "收入") {
+        const payload = incomePayload(updated);
+        await db.prepare("UPDATE incomes SET occurred_on=?, amount=?, payee=? WHERE user_id=? AND txn_id=? AND source='明细'")
+          .bind(updated.txn_date, payload.amount, payload.payee, userId, updated.id).run();
+      }
       await rebuildBalances(db, userId, current.account_id);
       return {};
     }

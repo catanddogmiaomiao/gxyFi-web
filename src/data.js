@@ -1,9 +1,11 @@
-import { applyPosition, normalizeRecord, parseImport, planFields, valuePlans } from "./dca.js";
+import { applyPosition, checkRecordAllowed, checkStop, normalizeRecord, normalizeStatus, parseImport, planFields, saleFields, stopFields, valuePlans } from "./dca.js";
+import { chinaToday, investSnapshot, liquidTrend } from "./liquid.js";
 import { mutateTxns, rebuildBalances, txnRev, unlinkAccount } from "./txns.js";
 
 const TXN_ENTITIES = new Set(["account_map", "txn_import", "txn", "txn_batch", "txn_classify", "txn_rule"]);
 
 const CATEGORIES = ["居住", "餐饮", "交通", "教育", "医疗", "保险", "日用", "人情", "娱乐", "其他"];
+const INCOME_CATEGORIES = ["工资", "奖金", "理财收益", "租金", "兼职", "报销", "其他收入"];
 const KINDS = ["现金", "活期", "定期", "货币基金", "公积金", "其他"];
 const PROPERTY_KINDS = ["住宅", "商铺", "车位", "土地", "其他"];
 const CURRENCIES = ["CNY", "USD", "HKD"];
@@ -62,9 +64,16 @@ function oneOf(value, allowed, fallback) {
 
 export async function ensureCategories(db, userId) {
   const row = await db.prepare("SELECT COUNT(*) AS n FROM expense_categories WHERE user_id=?").bind(userId).first();
-  if (row.n) return;
-  for (let index = 0; index < CATEGORIES.length; index += 1) {
-    await db.prepare("INSERT INTO expense_categories(user_id, name, sort_order) VALUES(?, ?, ?)").bind(userId, CATEGORIES[index], index).run();
+  if (!row.n) {
+    for (let index = 0; index < CATEGORIES.length; index += 1) {
+      await db.prepare("INSERT INTO expense_categories(user_id, name, sort_order) VALUES(?, ?, ?)").bind(userId, CATEGORIES[index], index).run();
+    }
+  }
+  const incomeRow = await db.prepare("SELECT COUNT(*) AS n FROM income_categories WHERE user_id=?").bind(userId).first();
+  if (!incomeRow.n) {
+    for (let index = 0; index < INCOME_CATEGORIES.length; index += 1) {
+      await db.prepare("INSERT INTO income_categories(user_id, name, sort_order) VALUES(?, ?, ?)").bind(userId, INCOME_CATEGORIES[index], index).run();
+    }
   }
 }
 
@@ -154,6 +163,35 @@ export async function mutate(db, userId, body) {
     return;
   }
 
+  if (entity === "holding_sale" || entity === "dca_sale") {
+    const table = entity === "holding_sale" ? "holdings" : "dca_plans";
+    await owned(db, `SELECT id FROM ${table} WHERE user_id=? AND id=?`, userId, id);
+    if (data.sell_price == null || data.sell_price === "") {
+      await db.prepare(`UPDATE ${table} SET sell_price=NULL, sold_on=NULL, count_invested=0 WHERE user_id=? AND id=?`).bind(userId, id).run();
+      return;
+    }
+    const sale = saleFields(data);
+    if (entity === "dca_sale") {
+      const records = (await db.prepare("SELECT * FROM dca_records WHERE user_id=? AND plan_id=? ORDER BY trade_date, id").bind(userId, id).all()).results;
+      if (applyPosition(records).shares <= 0) throw new Error("没有可卖出的份额");
+    }
+    await db.prepare(`UPDATE ${table} SET sell_price=?, sold_on=?, count_invested=? WHERE user_id=? AND id=?`).bind(sale.sell_price, sale.sold_on, sale.count_invested, userId, id).run();
+    return;
+  }
+
+  if (entity === "liquid_day") {
+    const day = String(data.day || chinaToday());
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) throw new Error("日期不正确");
+    const invest = Number(data.invest_cny);
+    if (!Number.isFinite(invest)) throw new Error("投资金额不正确");
+    const parts = JSON.stringify(Array.isArray(data.parts) ? data.parts : []);
+    await db.prepare(
+      `INSERT INTO liquid_days(user_id, day, invest_cny, parts_json) VALUES(?,?,?,?)
+       ON CONFLICT(user_id, day) DO UPDATE SET invest_cny=excluded.invest_cny, parts_json=excluded.parts_json`,
+    ).bind(userId, day, invest, parts).run();
+    return;
+  }
+
   if (entity === "property") {
     if (op === "delete") {
       await owned(db, "SELECT id FROM properties WHERE user_id=? AND id=?", userId, id);
@@ -187,12 +225,57 @@ export async function mutate(db, userId, body) {
   }
 
   if (entity === "category") {
+    if (op === "update") {
+      const current = await owned(db, "SELECT * FROM expense_categories WHERE user_id=? AND id=?", userId, id);
+      const name = data.name == null || String(data.name).trim() === "" ? current.name : requiredText(data.name, "类别名称", 40);
+      const active = data.active == null ? (Number(current.active) ? 1 : 0) : (Number(data.active) ? 1 : 0);
+      if (!active) {
+        const others = await db.prepare("SELECT COUNT(*) AS n FROM expense_categories WHERE user_id=? AND active=1 AND id<>?").bind(userId, id).first();
+        if (!others.n) throw new Error("至少保留一个在用的类别");
+      }
+      try {
+        await db.prepare("UPDATE expense_categories SET name=?, active=? WHERE user_id=? AND id=?").bind(name, active, userId, id).run();
+      } catch {
+        throw new Error("这个类别已经存在");
+      }
+      return;
+    }
     const name = requiredText(data.name, "类别名称", 40);
     const order = await db.prepare("SELECT COALESCE(MAX(sort_order), -1) + 1 AS n FROM expense_categories WHERE user_id=?").bind(userId).first();
     try {
       await db.prepare("INSERT INTO expense_categories(user_id, name, sort_order) VALUES(?,?,?)").bind(userId, name, order.n).run();
     } catch {
       throw new Error("这个类别已经存在");
+    }
+    return;
+  }
+
+  if (entity === "category_move") {
+    const sourceId = Number(id);
+    const targetId = Number(data.target_id);
+    if (!sourceId || sourceId === targetId) throw new Error("请选择另一个类别");
+    await owned(db, "SELECT id FROM expense_categories WHERE user_id=? AND id=?", userId, sourceId);
+    await owned(db, "SELECT id FROM expense_categories WHERE user_id=? AND id=?", userId, targetId);
+    await db.prepare("UPDATE expenses SET category_id=? WHERE user_id=? AND category_id=?").bind(targetId, userId, sourceId).run();
+    await db.prepare("UPDATE account_txns SET category_id=?, updated_at=? WHERE user_id=? AND category_id=? AND treat IN ('支出', '退款')").bind(targetId, stamp, userId, sourceId).run();
+    const rules = (await db.prepare("SELECT id, field, keyword FROM txn_rules WHERE user_id=? AND category_id=? AND treat IN ('支出', '退款')").bind(userId, sourceId).all()).results;
+    for (const rule of rules) {
+      const clash = await db.prepare("SELECT id FROM txn_rules WHERE user_id=? AND field=? AND keyword=? AND id<>?").bind(userId, rule.field, rule.keyword, rule.id).first();
+      if (clash) await db.prepare("DELETE FROM txn_rules WHERE user_id=? AND id=?").bind(userId, rule.id).run();
+      else await db.prepare("UPDATE txn_rules SET category_id=? WHERE user_id=? AND id=?").bind(targetId, userId, rule.id).run();
+    }
+    const lines = (await db.prepare("SELECT * FROM budget_lines WHERE user_id=? AND category_id=?").bind(userId, sourceId).all()).results;
+    for (const line of lines) {
+      const existing = await db.prepare("SELECT * FROM budget_lines WHERE user_id=? AND year=? AND category_id=?").bind(userId, line.year, targetId).first();
+      if (!existing) {
+        await db.prepare("UPDATE budget_lines SET category_id=? WHERE user_id=? AND id=?").bind(targetId, userId, line.id).run();
+        continue;
+      }
+      let note = existing.note || "";
+      const extra = line.note || "";
+      if (extra && note.indexOf(extra) < 0) note = note ? note + "；" + extra : extra;
+      await db.prepare("UPDATE budget_lines SET amount=?, note=? WHERE user_id=? AND id=?").bind(Number(existing.amount) + Number(line.amount), note.slice(0, 300), userId, existing.id).run();
+      await db.prepare("DELETE FROM budget_lines WHERE user_id=? AND id=?").bind(userId, line.id).run();
     }
     return;
   }
@@ -207,17 +290,88 @@ export async function mutate(db, userId, body) {
       return;
     }
     const categoryId = Number(data.category_id);
-    await owned(db, "SELECT id FROM expense_categories WHERE user_id=? AND id=?", userId, categoryId);
+    const category = await owned(db, "SELECT id, active FROM expense_categories WHERE user_id=? AND id=?", userId, categoryId);
     const fields = [categoryId, day(data.occurred_on, "日期", true), money(data.amount, "金额", { required: true, allowZero: false }), text(data.payee, 80), text(data.note, 300)];
     if (op === "update") {
-      const current = await owned(db, "SELECT id, txn_id FROM expenses WHERE user_id=? AND id=?", userId, id);
+      const current = await owned(db, "SELECT id, txn_id, category_id FROM expenses WHERE user_id=? AND id=?", userId, id);
+      if (!Number(category.active) && current.category_id !== categoryId) throw new Error("这个类别已停用，请改到在用的类别");
       await db.prepare("UPDATE expenses SET category_id=?, occurred_on=?, amount=?, payee=?, note=? WHERE user_id=? AND id=?").bind(...fields, userId, id).run();
       if (current.txn_id) {
         await db.prepare("UPDATE account_txns SET category_id=?, updated_at=? WHERE user_id=? AND id=?").bind(categoryId, stamp, userId, current.txn_id).run();
       }
       return;
     }
+    if (!Number(category.active)) throw new Error("这个类别已停用，请改到在用的类别");
     await db.prepare("INSERT INTO expenses(user_id, category_id, occurred_on, amount, payee, note, created_at) VALUES(?,?,?,?,?,?,?)").bind(userId, ...fields, stamp).run();
+    return;
+  }
+
+  if (entity === "income_category") {
+    if (op === "update") {
+      const current = await owned(db, "SELECT * FROM income_categories WHERE user_id=? AND id=?", userId, id);
+      const name = data.name == null || String(data.name).trim() === "" ? current.name : requiredText(data.name, "类别名称", 40);
+      const active = data.active == null ? (Number(current.active) ? 1 : 0) : (Number(data.active) ? 1 : 0);
+      if (!active) {
+        const others = await db.prepare("SELECT COUNT(*) AS n FROM income_categories WHERE user_id=? AND active=1 AND id<>?").bind(userId, id).first();
+        if (!others.n) throw new Error("至少保留一个在用的类别");
+      }
+      try {
+        await db.prepare("UPDATE income_categories SET name=?, active=? WHERE user_id=? AND id=?").bind(name, active, userId, id).run();
+      } catch {
+        throw new Error("这个类别已经存在");
+      }
+      return;
+    }
+    const name = requiredText(data.name, "类别名称", 40);
+    const order = await db.prepare("SELECT COALESCE(MAX(sort_order), -1) + 1 AS n FROM income_categories WHERE user_id=?").bind(userId).first();
+    try {
+      await db.prepare("INSERT INTO income_categories(user_id, name, sort_order) VALUES(?,?,?)").bind(userId, name, order.n).run();
+    } catch {
+      throw new Error("这个类别已经存在");
+    }
+    return;
+  }
+
+  if (entity === "income_category_move") {
+    const sourceId = Number(id);
+    const targetId = Number(data.target_id);
+    if (!sourceId || sourceId === targetId) throw new Error("请选择另一个类别");
+    await owned(db, "SELECT id FROM income_categories WHERE user_id=? AND id=?", userId, sourceId);
+    await owned(db, "SELECT id FROM income_categories WHERE user_id=? AND id=?", userId, targetId);
+    await db.prepare("UPDATE incomes SET category_id=? WHERE user_id=? AND category_id=?").bind(targetId, userId, sourceId).run();
+    await db.prepare("UPDATE account_txns SET category_id=?, updated_at=? WHERE user_id=? AND category_id=? AND treat='收入'").bind(targetId, stamp, userId, sourceId).run();
+    const rules = (await db.prepare("SELECT id, field, keyword FROM txn_rules WHERE user_id=? AND category_id=? AND treat='收入'").bind(userId, sourceId).all()).results;
+    for (const rule of rules) {
+      const clash = await db.prepare("SELECT id FROM txn_rules WHERE user_id=? AND field=? AND keyword=? AND id<>?").bind(userId, rule.field, rule.keyword, rule.id).first();
+      if (clash) await db.prepare("DELETE FROM txn_rules WHERE user_id=? AND id=?").bind(userId, rule.id).run();
+      else await db.prepare("UPDATE txn_rules SET category_id=? WHERE user_id=? AND id=?").bind(targetId, userId, rule.id).run();
+    }
+    return;
+  }
+
+  if (entity === "income") {
+    if (op === "delete") {
+      const current = await owned(db, "SELECT id, txn_id FROM incomes WHERE user_id=? AND id=?", userId, id);
+      await db.prepare("DELETE FROM incomes WHERE user_id=? AND id=?").bind(userId, id).run();
+      if (current.txn_id) {
+        await db.prepare("UPDATE account_txns SET treat='不计', category_id=NULL, updated_at=? WHERE user_id=? AND id=?").bind(stamp, userId, current.txn_id).run();
+      }
+      return;
+    }
+    const categoryId = Number(data.category_id);
+    const category = await owned(db, "SELECT id, active FROM income_categories WHERE user_id=? AND id=?", userId, categoryId);
+    const fields = [categoryId, day(data.occurred_on, "日期", true), money(data.amount, "金额", { required: true, allowZero: false }), text(data.payee, 80), text(data.note, 300)];
+    if (op === "update") {
+      const current = await owned(db, "SELECT id, txn_id, category_id FROM incomes WHERE user_id=? AND id=?", userId, id);
+      if (!Number(category.active) && current.category_id !== categoryId) throw new Error("这个类别已停用，请改到在用的类别");
+      await db.prepare("UPDATE incomes SET category_id=?, occurred_on=?, amount=?, payee=?, note=? WHERE user_id=? AND id=?").bind(...fields, userId, id).run();
+      if (current.txn_id) {
+        await db.prepare("UPDATE account_txns SET category_id=?, updated_at=? WHERE user_id=? AND id=?").bind(categoryId, stamp, userId, current.txn_id).run();
+      }
+      return;
+    }
+    if (!Number(category.active)) throw new Error("这个类别已停用，请改到在用的类别");
+    await db.prepare("INSERT INTO incomes(user_id, category_id, occurred_on, amount, payee, note, created_at) VALUES(?,?,?,?,?,?,?)").bind(userId, ...fields, stamp).run();
     return;
   }
 
@@ -245,10 +399,22 @@ export async function mutate(db, userId, body) {
     const fields = planFields(data);
     if (op === "update") {
       await owned(db, "SELECT id FROM dca_plans WHERE user_id=? AND id=?", userId, id);
-      await db.prepare("UPDATE dca_plans SET name=?, symbol=?, amount=?, cycle=?, debit_day=?, status=?, started_on=?, manual_nav=?, note=? WHERE user_id=? AND id=?").bind(...fields, userId, id).run();
+      await db.prepare("UPDATE dca_plans SET name=?, symbol=?, amount=?, cycle=?, debit_day=?, status=?, started_on=?, manual_nav=?, note=?, stopped_on=?, stop_reason=? WHERE user_id=? AND id=?").bind(...fields, userId, id).run();
       return;
     }
-    await db.prepare("INSERT INTO dca_plans(user_id, name, symbol, amount, cycle, debit_day, status, started_on, manual_nav, note, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)").bind(userId, ...fields, stamp).run();
+    await db.prepare("INSERT INTO dca_plans(user_id, name, symbol, amount, cycle, debit_day, status, started_on, manual_nav, note, stopped_on, stop_reason, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(userId, ...fields, stamp).run();
+    return;
+  }
+
+  if (entity === "dca_plan_status") {
+    await owned(db, "SELECT id FROM dca_plans WHERE user_id=? AND id=?", userId, id);
+    const status = normalizeStatus(data.status);
+    const stop = stopFields(status, data);
+    if (stop.stopped_on) {
+      const records = (await db.prepare("SELECT kind, trade_date FROM dca_records WHERE user_id=? AND plan_id=?").bind(userId, id).all()).results;
+      checkStop(stop.stopped_on, records);
+    }
+    await db.prepare("UPDATE dca_plans SET status=?, stopped_on=?, stop_reason=? WHERE user_id=? AND id=?").bind(status, stop.stopped_on, stop.stop_reason, userId, id).run();
     return;
   }
 
@@ -261,10 +427,11 @@ export async function mutate(db, userId, body) {
       await db.prepare("DELETE FROM dca_records WHERE user_id=? AND id=?").bind(userId, id).run();
       return;
     }
-    await owned(db, "SELECT id FROM dca_plans WHERE user_id=? AND id=?", userId, planId);
+    const plan = await owned(db, "SELECT * FROM dca_plans WHERE user_id=? AND id=?", userId, planId);
     const existing = (await db.prepare("SELECT * FROM dca_records WHERE user_id=? AND plan_id=? ORDER BY trade_date, id").bind(userId, planId).all()).results;
     if (entity === "dca_import") {
       const incoming = parseImport(data.text);
+      incoming.forEach((row) => checkRecordAllowed(plan, row));
       applyPosition(existing.concat(incoming.map((row, index) => ({ ...row, id: 10 ** 12 + index }))));
       for (const row of incoming) {
         await db.prepare("INSERT INTO dca_records(user_id, plan_id, kind, trade_date, amount, nav, shares, fee, note, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)").bind(
@@ -274,6 +441,7 @@ export async function mutate(db, userId, body) {
       return;
     }
     const normalized = normalizeRecord(data);
+    checkRecordAllowed(plan, normalized);
     const draft = [];
     let replaced = op !== "update";
     for (const row of existing) {
@@ -310,16 +478,43 @@ export async function mutate(db, userId, body) {
   throw new Error("不支持的操作");
 }
 
+async function readLiquidDays(db, userId) {
+  try {
+    return (await db.prepare("SELECT day, invest_cny, parts_json FROM liquid_days WHERE user_id=? ORDER BY day").bind(userId).all()).results;
+  } catch (error) {
+    if (String(error && error.message || error).includes("no such table")) return [];
+    throw error;
+  }
+}
+
 export async function loadState(db, userId) {
   await ensureCategories(db, userId);
   const all = async (sql) => (await db.prepare(sql).bind(userId).all()).results;
   const dcaRecords = await all("SELECT * FROM dca_records WHERE user_id=? ORDER BY trade_date, id");
   const dcaPlans = valuePlans(await all("SELECT * FROM dca_plans WHERE user_id=? ORDER BY status, symbol, id"), dcaRecords);
+  const accounts = await all("SELECT * FROM accounts WHERE user_id=? ORDER BY id");
+  const balances = await all("SELECT * FROM balance_entries WHERE user_id=? ORDER BY as_of_date DESC, id DESC");
+  const holdings = await all("SELECT * FROM holdings WHERE user_id=? ORDER BY market, symbol, id");
+  const quotes = await all("SELECT * FROM quotes WHERE user_id=? ORDER BY market, symbol");
+  const fx = await all("SELECT * FROM fx_rates WHERE user_id=? ORDER BY code");
+  const rates = Object.fromEntries(fx.map((row) => [row.code, row.rate]));
+  const today = chinaToday();
+  const snap = investSnapshot(holdings, dcaPlans, quotes, rates);
+  try {
+    await db.prepare(
+      `INSERT INTO liquid_days(user_id, day, invest_cny, parts_json) VALUES(?,?,?,?)
+       ON CONFLICT(user_id, day) DO UPDATE SET invest_cny=excluded.invest_cny, parts_json=excluded.parts_json`,
+    ).bind(userId, today, snap.invest_cny, JSON.stringify(snap.parts)).run();
+  } catch (error) {
+    if (!String(error && error.message || error).includes("no such table")) throw error;
+  }
+  const liquidDays = await readLiquidDays(db, userId);
+  const trendOf = (span) => liquidTrend({ span, today, accounts, balances, rates, liquidDays });
   return {
-    accounts: await all("SELECT * FROM accounts WHERE user_id=? ORDER BY id"),
-    balances: await all("SELECT * FROM balance_entries WHERE user_id=? ORDER BY as_of_date DESC, id DESC"),
-    holdings: await all("SELECT * FROM holdings WHERE user_id=? ORDER BY market, symbol, id"),
-    quotes: await all("SELECT * FROM quotes WHERE user_id=? ORDER BY market, symbol"),
+    accounts,
+    balances,
+    holdings,
+    quotes,
     properties: await all("SELECT * FROM properties WHERE user_id=? ORDER BY id"),
     categories: await all("SELECT * FROM expense_categories WHERE user_id=? ORDER BY sort_order, id"),
     expenses: await all(
@@ -327,8 +522,21 @@ export async function loadState(db, userId) {
        FROM expenses e JOIN expense_categories c ON c.id = e.category_id AND c.user_id = e.user_id
        WHERE e.user_id=? ORDER BY e.occurred_on DESC, e.id DESC`,
     ),
+    incomeCategories: await all("SELECT * FROM income_categories WHERE user_id=? ORDER BY sort_order, id"),
+    incomes: await all(
+      `SELECT e.*, c.name AS category
+       FROM incomes e JOIN income_categories c ON c.id = e.category_id AND c.user_id = e.user_id
+       WHERE e.user_id=? ORDER BY e.occurred_on DESC, e.id DESC`,
+    ),
     budgets: await all("SELECT * FROM budget_lines WHERE user_id=? ORDER BY year, category_id"),
-    fx: await all("SELECT * FROM fx_rates WHERE user_id=? ORDER BY code"),
+    fx,
+    liquid: {
+      week: trendOf("week"),
+      month: trendOf("month"),
+      year: trendOf("year"),
+      decade: trendOf("decade"),
+    },
+    liquidDays,
     dcaPlans,
     dcaRecords,
     txnRules: await all("SELECT id, field, keyword, treat, category_id, created_at FROM txn_rules WHERE user_id=? ORDER BY id"),

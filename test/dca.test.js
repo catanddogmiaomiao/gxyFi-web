@@ -34,3 +34,15 @@ test("pasted history uses header names", () => {
   assert.equal(rows.length, 1);
   assert.equal(rows[0].shares, 50);
 });
+
+test("stopped plan blocks later DCA but keeps redemptions", async () => {
+  const { checkRecordAllowed, checkStop, planFields } = await import("../src/dca.js");
+  const plan = { name: "沪深300", status: "已停止", stopped_on: "2026-06-30" };
+  assert.throws(() => checkRecordAllowed(plan, { kind: "定投", trade_date: "2026-07-05" }));
+  checkRecordAllowed(plan, { kind: "定投", trade_date: "2026-06-30" });
+  checkRecordAllowed(plan, { kind: "赎回", trade_date: "2026-09-01" });
+  assert.throws(() => checkStop("2026-05-01", [{ kind: "定投", trade_date: "2026-06-01" }]));
+  const fields = planFields({ name: "A", symbol: "000001", amount: "100", cycle: "每月", debit_day: "8", status: "已结束", stopped_on: "2026-01-02" });
+  assert.equal(fields[5], "已停止");
+  assert.equal(fields[9], "2026-01-02");
+});

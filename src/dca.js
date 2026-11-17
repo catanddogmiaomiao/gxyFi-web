@@ -1,5 +1,52 @@
 const CYCLES = ["每月", "每周", "每两周"];
-const STATUSES = ["进行中", "已暂停", "已结束"];
+export const STOPPED = "已停止";
+const STATUSES = ["进行中", "已暂停", STOPPED];
+const STATUS_ALIASES = { 已结束: STOPPED, 停止: STOPPED, 已终止: STOPPED };
+
+export function normalizeStatus(value) {
+  const text = String(value || "进行中").trim();
+  const status = STATUS_ALIASES[text] || text;
+  if (!STATUSES.includes(status)) throw new Error("状态不正确");
+  return status;
+}
+
+// 停止后份额继续持有，可以记赎回和红利再投，但不能再记停止日期之后的定投。
+export function isSold(row) {
+  return row != null && row.sell_price != null && row.sell_price !== "";
+}
+
+export function saleFields(data) {
+  const price = numberOrEmpty(data.sell_price, "卖出价格");
+  if (price == null || price <= 0) throw new Error("卖出价格需要大于 0");
+  const sold = String(data.sold_on || "").trim() || new Date().toISOString().slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(sold)) throw new Error("卖出日期请写成 YYYY-MM-DD");
+  const flag = data.count_invested;
+  const counted = flag === true || flag === 1 || flag === "1" || flag === "on" || flag === "true" || flag === "yes" ? 1 : 0;
+  return { sell_price: round4(price), sold_on: sold, count_invested: counted };
+}
+
+export function checkRecordAllowed(plan, record) {
+  if (isSold(plan)) throw new Error("「" + (plan.name || plan.symbol) + "」已卖出。要继续记确认，请先撤销卖出。");
+  if (plan.status !== STOPPED || record.kind !== "定投") return;
+  const stopped = plan.stopped_on || "";
+  if (!stopped || record.trade_date > stopped) {
+    throw new Error("「" + (plan.name || plan.symbol) + "」已在 " + (stopped || "之前") + " 停止定投，不能再记之后的定投扣款。如果恢复了，请先恢复定投。");
+  }
+}
+
+export function checkStop(stoppedOn, records) {
+  const paid = records.filter((row) => row.kind === "定投").map((row) => row.trade_date).sort();
+  if (paid.length && stoppedOn < paid[paid.length - 1]) throw new Error("停止日期不能早于最后一笔定投（" + paid[paid.length - 1] + "）");
+}
+
+function statusLabel(plan) {
+  if (isSold(plan)) {
+    const counted = Number(plan.count_invested) === 1 ? "计入投资" : "不计入投资";
+    return ["已卖出", plan.sold_on, counted].filter(Boolean).join(" · ");
+  }
+  if (plan.status !== STOPPED) return plan.status || "";
+  return [STOPPED, plan.stopped_on, plan.stop_reason].filter(Boolean).join(" · ");
+}
 const KINDS = ["期初", "定投", "赎回", "红利再投"];
 const WEEKDAYS = ["", "周一", "周二", "周三", "周四", "周五"];
 const KIND_ALIASES = {
@@ -133,16 +180,25 @@ export function valuePlans(plans, records) {
   return plans.map((plan) => {
     const own = records.filter((row) => Number(row.plan_id) === Number(plan.id));
     const position = applyPosition(own);
-    const priced = latestNav(plan.manual_nav, own);
-    const marketValue = priced.nav == null || position.shares <= 0 ? null : round2(position.shares * priced.nav);
+    const sold = isSold(plan);
+    const priced = sold ? { nav: Number(plan.sell_price), source: "已卖出" } : latestNav(plan.manual_nav, own);
+    const proceeds = sold ? (position.shares > 0 ? round2(position.shares * priced.nav) : 0) : null;
+    const counted = Number(plan.count_invested) === 1;
+    const openValue = priced.nav == null || position.shares <= 0 ? null : round2(position.shares * priced.nav);
+    const marketValue = sold ? (counted ? proceeds : 0) : openValue;
+    const basis = sold ? proceeds : openValue;
     return {
       ...plan,
       ...position,
       nav: priced.nav,
       nav_source: priced.source,
       market_value: marketValue,
-      pnl: marketValue == null ? null : round2(marketValue - position.cost),
-      cycle_label: cycleLabel(plan.cycle, plan.debit_day),
+      proceeds,
+      pnl: basis == null ? null : round2(basis - position.cost),
+      sold,
+      in_invest: sold ? counted : marketValue != null,
+      cycle_label: plan.status === STOPPED ? "不再扣款" : cycleLabel(plan.cycle, plan.debit_day),
+      status_label: statusLabel(plan),
       record_count: own.length,
     };
   });
@@ -190,11 +246,18 @@ export function planFields(data) {
   const debitDay = Number(data.debit_day);
   const limit = cycle === "每月" ? 28 : 5;
   if (!Number.isInteger(debitDay) || debitDay < 1 || debitDay > limit) throw new Error("扣款日不在可选范围内");
-  const status = STATUSES.includes(data.status) ? data.status : "";
-  if (!status) throw new Error("状态不正确");
+  const status = normalizeStatus(data.status);
   const started = String(data.started_on || "").trim();
   if (started && !/^\d{4}-\d{2}-\d{2}$/.test(started)) throw new Error("开始日期请写成 YYYY-MM-DD");
   const manual = numberOrEmpty(data.manual_nav, "最新净值");
   if (manual != null && manual <= 0) throw new Error("最新净值需要大于 0");
-  return [name, symbol, round2(amount), cycle, debitDay, status, started || null, manual == null ? null : round4(manual), String(data.note || "").trim()];
+  const stop = stopFields(status, data);
+  return [name, symbol, round2(amount), cycle, debitDay, status, started || null, manual == null ? null : round4(manual), String(data.note || "").trim(), stop.stopped_on, stop.stop_reason];
+}
+
+export function stopFields(status, data) {
+  if (status !== STOPPED) return { stopped_on: null, stop_reason: "" };
+  const day = String(data.stopped_on || "").trim() || new Date().toISOString().slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) throw new Error("停止日期请写成 YYYY-MM-DD");
+  return { stopped_on: day, stop_reason: String(data.stop_reason || "").trim().slice(0, 80) };
 }

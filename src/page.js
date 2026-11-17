@@ -70,11 +70,13 @@ export const PAGE = `<!DOCTYPE html>
     <em>云端台账</em>
     <nav>
       <button type="button" data-view="dash" class="on">01 总览</button>
-      <button type="button" data-view="accounts">02 储蓄</button>
-      <button type="button" data-view="invest">03 投资</button>
-      <button type="button" data-view="property">04 不动产</button>
-      <button type="button" data-view="expenses">05 支出</button>
-      <button type="button" data-view="budget">06 预算</button>
+      <button type="button" data-view="liquid">02 非固资</button>
+      <button type="button" data-view="accounts">03 储蓄</button>
+      <button type="button" data-view="invest">04 投资</button>
+      <button type="button" data-view="property">05 不动产</button>
+      <button type="button" data-view="expenses">06 支出</button>
+      <button type="button" data-view="incomes">07 收入</button>
+      <button type="button" data-view="budget">08 预算</button>
     </nav>
   </aside>
   <main>
@@ -86,10 +88,12 @@ export const PAGE = `<!DOCTYPE html>
     </header>
     <p class="error" id="appError"></p>
     <section class="view on" id="dash"></section>
+    <section class="view" id="liquid"></section>
     <section class="view" id="accounts"></section>
     <section class="view" id="invest"></section>
     <section class="view" id="property"></section>
     <section class="view" id="expenses"></section>
+    <section class="view" id="incomes"></section>
     <section class="view" id="budget"></section>
   </main>
 </div>
@@ -114,6 +118,21 @@ function toCny(amount, currency) {
 }
 function latestBalance(accountId) {
   return (state.balances || []).find((row) => row.account_id === accountId);
+}
+function valueHolding(holding) {
+  const sold = holding.sell_price != null && holding.sell_price !== "";
+  const counted = Number(holding.count_invested) === 1;
+  const priced = sold
+    ? { price: Number(holding.sell_price), source: ["已卖出", holding.sold_on, counted ? "计入投资" : "不计入投资"].filter(Boolean).join(" · ") }
+    : priceOf(holding);
+  const quantity = Number(holding.quantity);
+  const avg = holding.avg_cost == null || holding.avg_cost === "" ? null : Number(holding.avg_cost);
+  const gross = priced.price == null ? null : priced.price * quantity;
+  const full = gross == null ? null : toCny(gross, holding.currency);
+  const cost = avg == null ? null : toCny(avg * quantity, holding.currency);
+  const pnl = full == null || cost == null ? null : full - cost;
+  const ret = priced.price == null || !avg ? null : priced.price / avg - 1;
+  return { holding, priced, avg, full, value: sold && !counted ? 0 : full, cost, pnl, ret, sold, counted };
 }
 function quoteFor(holding) {
   return (state.quotes || []).find((row) => row.market === holding.market && row.symbol === holding.symbol && row.ok);
@@ -197,17 +216,152 @@ function removeButton(entity, id) {
   });
   return button;
 }
+function saleButton(entity, row) {
+  const button = el("button", row.sell_price != null && row.sell_price !== "" ? "改卖出" : "卖出");
+  button.type = "button";
+  button.className = "ghost";
+  button.addEventListener("click", async () => {
+    const price = window.prompt("卖出价格。留空并确定则撤销卖出。", row.sell_price == null ? "" : String(row.sell_price));
+    if (price == null) return;
+    if (!String(price).trim()) {
+      if (!window.confirm("撤销卖出，恢复成持有？")) return;
+      try { await save(entity, { sell_price: "" }, row.id); } catch (error) { showError(error); }
+      return;
+    }
+    const choice = window.prompt("卖出金额是否仍计入整体投资？输入 1 计入，输入 0 不计入。记录都会保留。", Number(row.count_invested) === 1 ? "1" : "0");
+    if (choice == null) return;
+    const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+    try {
+      await save(entity, { sell_price: price, sold_on: row.sold_on || today, count_invested: String(choice).trim() === "1" ? 1 : 0 }, row.id);
+    } catch (error) { showError(error); }
+  });
+  return button;
+}
+function stopButton(plan) {
+  const stopped = plan.status === "已停止";
+  const button = el("button", stopped ? "恢复定投" : "停止定投");
+  button.type = "button";
+  button.addEventListener("click", async () => {
+    try {
+      if (stopped) {
+        if (!window.confirm("恢复「" + plan.name + "」的定投？停止日期和原因会清掉。")) return;
+        await save("dca_plan_status", { status: "进行中" }, plan.id);
+        return;
+      }
+      const today = new Date().toISOString().slice(0, 10);
+      const day = window.prompt("停止日期（YYYY-MM-DD）。停止后不再扣款，份额继续持有。", today);
+      if (day == null) return;
+      const reason = window.prompt("停止原因，例如 政策调整、基金暂停申购、达到目标", "政策调整");
+      if (reason == null) return;
+      await save("dca_plan_status", { status: "已停止", stopped_on: day.trim(), stop_reason: reason.trim() }, plan.id);
+    } catch (error) { showError(error); }
+  });
+  return button;
+}
 async function remove(entity, id) {
   await refreshState(await post("/api/mutate", { entity, op: "delete", id }));
 }
 
 function render() {
   renderDash();
+  renderLiquid();
   renderAccounts();
   renderInvest();
   renderProperty();
   renderExpenses();
+  renderIncomes();
   renderBudget();
+}
+let liquidSpan = "month";
+function renderLiquid() {
+  const root = document.getElementById("liquid");
+  root.replaceChildren();
+  root.appendChild(el("h2", "非固定资产"));
+  root.appendChild(el("p", "只看储蓄和投资，不含不动产。储蓄按每次余额快照结转到每一天；投资从今天起逐日记下。周和月按天，年按每月最后一天，10 年按每年最后一天。点图上的日期看当天分项。", "hint"));
+  const bar = el("div");
+  bar.style.display = "flex";
+  bar.style.gap = "8px";
+  bar.style.margin = "8px 0";
+  const spans = [["week", "周"], ["month", "月"], ["year", "年"], ["decade", "10年"]];
+  spans.forEach(([key, label]) => {
+    const button = el("button", label);
+    button.type = "button";
+    button.className = key === liquidSpan ? "primary" : "ghost";
+    button.addEventListener("click", () => { liquidSpan = key; renderLiquid(); });
+    bar.appendChild(button);
+  });
+  root.appendChild(bar);
+  const trend = (state.liquid && state.liquid[liquidSpan]) || { points: [], invest_since: null };
+  const points = trend.points || [];
+  root.appendChild(trendSvg(points));
+  const end = points[points.length - 1];
+  const start = points[0];
+  if (start && end) {
+    const delta = start.total == null || end.total == null ? null : end.total - start.total;
+    root.appendChild(el("p", "期初 " + (start.total == null ? money(start.savings) + "（仅储蓄）" : money(start.total)) + " · 期末 " + (end.total == null ? money(end.savings) + "（仅储蓄）" : money(end.total)) + " · 变动 " + (delta == null ? "—" : money(delta)), "hint"));
+  }
+  root.appendChild(el("p", trend.invest_since ? "投资从 " + trend.invest_since + " 起有每日记录，更早的日期只画储蓄。外币按当前汇率折成人民币。" : "还没有投资的每日记录。打开页面会记下今天的投资。", "hint"));
+  if (!end) return;
+  const base = end.total || end.savings || 0;
+  root.appendChild(el("h2", end.day + " 分项"));
+  root.appendChild(table(["分项", "类别", "金额", "占比"], (end.parts || []).map((row) => [
+    row.name, row.group, money(row.amount), !base ? "—" : (row.amount / base * 100).toFixed(1) + "%",
+  ])));
+}
+function trendSvg(points) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 640 260");
+  svg.setAttribute("width", "100%");
+  svg.style.background = "#141922";
+  svg.style.border = "1px solid #2c261c";
+  svg.style.marginTop = "8px";
+  if (!points.length) return svg;
+  const values = [];
+  points.forEach((point) => ["savings", "invest", "total"].forEach((key) => { if (point[key] != null) values.push(Number(point[key])); }));
+  if (!values.length) return svg;
+  const low = Math.min(0, ...values);
+  const high = Math.max(...values) === low ? low + 1 : Math.max(...values);
+  const left = 16, right = 624, top = 28, bottom = 220;
+  const x = (index) => points.length === 1 ? (left + right) / 2 : left + (right - left) * index / (points.length - 1);
+  const y = (value) => bottom - (bottom - top) * (value - low) / (high - low);
+  const colors = { savings: "#8C9BAB", invest: "#C6A15B", total: "#F4E7C6" };
+  [["储蓄", colors.savings], ["投资", colors.invest], ["合计", colors.total]].forEach(([name, color], index) => {
+    const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    text.setAttribute("x", 16 + index * 70);
+    text.setAttribute("y", 16);
+    text.setAttribute("fill", color);
+    text.setAttribute("font-size", "12");
+    text.textContent = name;
+    svg.appendChild(text);
+  });
+  Object.entries(colors).forEach(([key, color]) => {
+    let started = false;
+    let path = "";
+    points.forEach((point, index) => {
+      if (point[key] == null) { started = false; return; }
+      path += (started ? "L" : "M") + x(index).toFixed(1) + " " + y(point[key]).toFixed(1) + " ";
+      started = true;
+    });
+    const node = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    node.setAttribute("d", path.trim());
+    node.setAttribute("fill", "none");
+    node.setAttribute("stroke", color);
+    node.setAttribute("stroke-width", "2");
+    svg.appendChild(node);
+  });
+  const step = points.length <= 12 ? 1 : Math.ceil(points.length / 6);
+  points.forEach((point, index) => {
+    if (index % step && index !== points.length - 1) return;
+    const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    text.setAttribute("x", x(index));
+    text.setAttribute("y", 244);
+    text.setAttribute("fill", "#8C877C");
+    text.setAttribute("font-size", "11");
+    text.setAttribute("text-anchor", "middle");
+    text.textContent = point.label;
+    svg.appendChild(text);
+  });
+  return svg;
 }
 function renderDash() {
   const root = document.getElementById("dash");
@@ -222,14 +376,15 @@ function renderDash() {
     if (cny == null) missing = true; else savings += cny;
   });
   state.holdings.forEach((holding) => {
-    const priced = priceOf(holding);
-    if (priced.price == null) { missing = true; return; }
-    const cny = toCny(priced.price * holding.quantity, holding.currency);
-    if (cny == null) missing = true; else invest += cny;
+    const row = valueHolding(holding);
+    if (row.sold && !row.counted) return;
+    if (row.full == null) { missing = true; return; }
+    invest += row.full;
   });
   (state.dcaPlans || []).forEach((plan) => {
-    if (Number(plan.shares) > 0 && plan.market_value == null) missing = true;
-    else if (plan.market_value != null) invest += Number(plan.market_value);
+    if (plan.sold && !plan.in_invest) return;
+    if (Number(plan.shares) > 0 && plan.nav == null) missing = true;
+    else if (plan.in_invest && plan.market_value != null) invest += Number(plan.market_value);
   });
   state.properties.forEach((item) => {
     if (item.current_value == null) { missing = true; return; }
@@ -237,9 +392,10 @@ function renderDash() {
   });
   const month = new Date().toISOString().slice(0, 7);
   const monthSpend = state.expenses.filter((row) => row.occurred_on.startsWith(month)).reduce((sum, row) => sum + Number(row.amount), 0);
+  const monthIncome = (state.incomes || []).filter((row) => row.occurred_on.startsWith(month)).reduce((sum, row) => sum + Number(row.amount), 0);
   const year = new Date().getFullYear();
   const planned = state.budgets.filter((row) => row.year === year).reduce((sum, row) => sum + Number(row.amount), 0);
-  const cards = [["储蓄", savings], ["投资", invest], ["不动产净值", property], ["净资产", savings + invest + property], ["本月支出", monthSpend], ["本年预算", planned]];
+  const cards = [["储蓄", savings], ["投资", invest], ["不动产净值", property], ["净资产", savings + invest + property], ["本月支出", monthSpend], ["本月收入", monthIncome]];
   const grid = el("div", null, "metrics");
   cards.forEach((card) => {
     const box = el("div", null, "metric");
@@ -368,28 +524,26 @@ function renderInvest() {
     catch (error) { showError(error); }
   });
   root.appendChild(form);
-  const valued = state.holdings.map((holding) => {
-    const priced = priceOf(holding);
-    const quantity = Number(holding.quantity);
-    const avg = holding.avg_cost == null || holding.avg_cost === "" ? null : Number(holding.avg_cost);
-    const value = priced.price == null ? null : toCny(priced.price * quantity, holding.currency);
-    const cost = avg == null ? null : toCny(avg * quantity, holding.currency);
-    const ret = priced.price == null || !avg ? null : priced.price / avg - 1;
-    return { holding, priced, avg, value, cost, pnl: value == null || cost == null ? null : value - cost, ret };
-  });
-  const totalValue = valued.reduce((sum, row) => sum + (row.value || 0), 0);
+  const valued = state.holdings.map(valueHolding);
+  const totalValue = valued.reduce((sum, row) => sum + (row.sold && !row.counted ? 0 : (row.full || 0)), 0);
   const pct = (value) => value == null ? "—" : (value * 100).toFixed(1) + "%";
-  const rows = valued.map((row) => [
-    row.holding.name, row.holding.symbol, row.holding.market, String(row.holding.quantity),
-    row.avg == null ? "未填" : money(row.avg), row.priced.price == null ? "—" : money(row.priced.price),
-    pct(row.ret), row.cost == null ? "—" : money(row.cost), row.value == null ? "—" : money(row.value),
-    row.pnl == null ? "—" : money(row.pnl), row.value == null || !totalValue ? "—" : pct(row.value / totalValue),
-    row.priced.source || "—", removeButton("holding", row.holding.id),
-  ]);
-  const withCost = valued.filter((row) => row.value != null && row.cost != null);
+  const rows = valued.map((row) => {
+    const shown = row.sold && !row.counted ? (row.full == null ? "—" : money(row.full) + " 不计") : (row.full == null ? "—" : money(row.full));
+    const actions = el("span");
+    actions.appendChild(saleButton("holding_sale", row.holding));
+    actions.appendChild(removeButton("holding", row.holding.id));
+    return [
+      row.holding.name, row.holding.symbol, row.holding.market, String(row.holding.quantity),
+      row.avg == null ? "未填" : money(row.avg), row.priced.price == null ? "—" : money(row.priced.price),
+      pct(row.ret), row.cost == null ? "—" : money(row.cost), shown,
+      row.pnl == null ? "—" : money(row.pnl), !totalValue || (row.sold && !row.counted) || row.full == null ? "—" : pct(row.full / totalValue),
+      row.priced.source || "—", actions,
+    ];
+  });
+  const withCost = valued.filter((row) => !(row.sold && !row.counted) && row.full != null && row.cost != null);
   if (valued.length) {
     const cost = withCost.reduce((sum, row) => sum + row.cost, 0);
-    const pnl = withCost.reduce((sum, row) => sum + row.value, 0) - cost;
+    const pnl = withCost.reduce((sum, row) => sum + row.full, 0) - cost;
     root.appendChild(el("p", "市值 ¥" + money(totalValue) + " · 成本 ¥" + money(cost) + " · 浮盈 ¥" + money(pnl) + "（" + pct(cost ? pnl / cost : null) + "）。收益率按原币计算，成本、市值、浮盈按当前汇率折成人民币。", "hint"));
   }
   root.appendChild(table(["名称", "代码", "市场", "数量", "成本价", "现价", "收益率", "成本¥", "市值¥", "浮盈¥", "占比", "来源", ""], rows));
@@ -403,7 +557,7 @@ function renderInvest() {
   field(planForm, "amount", "每期金额");
   field(planForm, "cycle", [["每月", "每月"], ["每周", "每周"], ["每两周", "每两周"]], "select");
   field(planForm, "debit_day", "扣款日：每月 1-28，每周 1-5");
-  field(planForm, "status", [["进行中", "进行中"], ["已暂停", "已暂停"], ["已结束", "已结束"]], "select");
+  field(planForm, "status", [["进行中", "进行中"], ["已暂停", "已暂停"]], "select");
   field(planForm, "manual_nav", "最新净值，可留空");
   const planButton = el("button", "新增计划");
   planButton.className = "primary";
@@ -414,11 +568,21 @@ function renderInvest() {
     catch (error) { showError(error); }
   });
   root.appendChild(planForm);
-  const planRows = plans.map((plan) => [
-    plan.name, plan.symbol, money(plan.amount), plan.cycle_label, plan.status, String(plan.shares),
-    money(plan.cost), plan.nav == null ? "—" : String(plan.nav), plan.market_value == null ? "—" : money(plan.market_value),
-    plan.pnl == null ? "—" : money(plan.pnl), removeButton("dca_plan", plan.id),
-  ]);
+  const planRows = plans.map((plan) => {
+    const actions = el("span");
+    actions.appendChild(saleButton("dca_sale", plan));
+    actions.appendChild(stopButton(plan));
+    actions.appendChild(removeButton("dca_plan", plan.id));
+    return [
+      plan.name, plan.symbol, money(plan.amount), plan.cycle_label, plan.status_label || plan.status, String(plan.shares),
+      money(plan.cost), plan.nav == null ? "—" : String(plan.nav),
+      plan.sold && !plan.in_invest ? (plan.proceeds == null ? "—" : money(plan.proceeds) + " 不计") : (plan.market_value == null ? "—" : money(plan.market_value)),
+      plan.pnl == null ? "—" : money(plan.pnl), actions,
+    ];
+  });
+  if (plans.some((plan) => plan.status === "已停止")) {
+    root.appendChild(el("p", "已停止的计划不再扣款，份额继续持有并计入市值；还可以记赎回和红利再投。", "hint"));
+  }
   root.appendChild(table(["基金", "代码", "每期", "周期", "状态", "份额", "成本", "净值", "市值", "浮盈", ""], planRows));
   if (!planChoices.length) return;
   const recordForm = document.createElement("form");
@@ -502,6 +666,7 @@ function renderExpenses() {
   field(form, "occurred_on", "日期 YYYY-MM-DD");
   const category = field(form, "category_id", [], "select");
   state.categories.forEach((item) => {
+    if (item.active === 0) return;
     const option = el("option", item.name);
     option.value = item.id;
     category.appendChild(option);
@@ -518,6 +683,147 @@ function renderExpenses() {
   });
   root.appendChild(form);
   root.appendChild(table(["日期", "类别", "金额", "对象", ""], state.expenses.map((row) => [row.occurred_on, row.category, money(row.amount), row.payee || "—", removeButton("expense", row.id)])));
+  root.appendChild(el("h2", "支出类别"));
+  root.appendChild(el("p", "停用后不能再用来记新账。过去的支出可以留在原类别，也可以调整到新类别。调整时，明细上的类别和自动归类规则会一起改。", "hint"));
+  const addForm = document.createElement("form");
+  addForm.className = "grid";
+  field(addForm, "name", "新类别名称");
+  const addButton = el("button", "新增类别");
+  addButton.className = "primary";
+  addForm.appendChild(addButton);
+  addForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try { await save("category", Object.fromEntries(new FormData(addForm))); addForm.reset(); }
+    catch (error) { showError(error); }
+  });
+  root.appendChild(addForm);
+  const counts = {};
+  state.expenses.forEach((row) => {
+    const item = counts[row.category_id] || { n: 0, total: 0 };
+    item.n += 1;
+    item.total += Number(row.amount);
+    counts[row.category_id] = item;
+  });
+  const categoryRows = state.categories.map((item) => {
+    const count = counts[item.id] || { n: 0, total: 0 };
+    const toggle = el("button", item.active === 0 ? "恢复" : "停用");
+    toggle.type = "button";
+    toggle.addEventListener("click", () => {
+      const stopping = item.active !== 0;
+      let text = stopping ? "停用「" + item.name + "」？之后记新账时不会再出现。" : "恢复「" + item.name + "」？";
+      if (stopping && count.n) text += "过去的 " + count.n + " 笔可以留在这一类，或在下面调整到新类别。";
+      if (!window.confirm(text)) return;
+      save("category", { active: stopping ? 0 : 1 }, item.id).catch(showError);
+    });
+    return [item.name, item.active === 0 ? "已停用" : "在用", String(count.n), money(count.total), toggle];
+  });
+  root.appendChild(table(["类别", "状态", "笔数", "合计", ""], categoryRows));
+  if (state.categories.length > 1) {
+    root.appendChild(el("p", "调整分类：左边是原类别，右边是新类别。", "hint"));
+    const moveForm = document.createElement("form");
+    moveForm.className = "grid";
+    const choices = state.categories.map((item) => [item.active === 0 ? item.name + "（已停用）" : item.name, String(item.id)]);
+    field(moveForm, "source_id", choices, "select");
+    field(moveForm, "target_id", choices, "select");
+    const moveButton = el("button", "调整历史支出");
+    moveButton.className = "primary";
+    moveForm.appendChild(moveButton);
+    moveForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const data = Object.fromEntries(new FormData(moveForm));
+      if (data.source_id === data.target_id) { showError(new Error("请选择另一个类别")); return; }
+      const source = state.categories.filter((item) => String(item.id) === data.source_id)[0];
+      const target = state.categories.filter((item) => String(item.id) === data.target_id)[0];
+      if (!window.confirm("把「" + source.name + "」的全部历史支出调整到「" + target.name + "」？")) return;
+      try { await save("category_move", { target_id: Number(data.target_id) }, Number(data.source_id)); }
+      catch (error) { showError(error); }
+    });
+    root.appendChild(moveForm);
+  }
+}
+function renderIncomes() {
+  const root = document.getElementById("incomes");
+  root.replaceChildren();
+  root.appendChild(el("h2", "收入"));
+  const form = document.createElement("form");
+  form.className = "grid";
+  field(form, "occurred_on", "日期 YYYY-MM-DD");
+  const category = field(form, "category_id", [], "select");
+  (state.incomeCategories || []).forEach((item) => {
+    if (item.active === 0) return;
+    const option = el("option", item.name);
+    option.value = item.id;
+    category.appendChild(option);
+  });
+  field(form, "amount", "金额");
+  field(form, "payee", "对象");
+  const button = el("button", "记一笔");
+  button.className = "primary";
+  form.appendChild(button);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try { await save("income", Object.fromEntries(new FormData(form))); }
+    catch (error) { showError(error); }
+  });
+  root.appendChild(form);
+  root.appendChild(table(["日期", "类别", "金额", "对象", ""], (state.incomes || []).map((row) => [row.occurred_on, row.category, money(row.amount), row.payee || "—", removeButton("income", row.id)])));
+  root.appendChild(el("h2", "收入类别"));
+  root.appendChild(el("p", "停用后不能再用来记新账。过去的收入可以留在原类别，也可以调整到新类别。", "hint"));
+  const addForm = document.createElement("form");
+  addForm.className = "grid";
+  field(addForm, "name", "新类别名称");
+  const addButton = el("button", "新增类别");
+  addButton.className = "primary";
+  addForm.appendChild(addButton);
+  addForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try { await save("income_category", Object.fromEntries(new FormData(addForm))); addForm.reset(); }
+    catch (error) { showError(error); }
+  });
+  root.appendChild(addForm);
+  const counts = {};
+  (state.incomes || []).forEach((row) => {
+    const item = counts[row.category_id] || { n: 0, total: 0 };
+    item.n += 1;
+    item.total += Number(row.amount);
+    counts[row.category_id] = item;
+  });
+  const categoryRows = (state.incomeCategories || []).map((item) => {
+    const count = counts[item.id] || { n: 0, total: 0 };
+    const toggle = el("button", item.active === 0 ? "恢复" : "停用");
+    toggle.type = "button";
+    toggle.addEventListener("click", () => {
+      const stopping = item.active !== 0;
+      let text = stopping ? "停用「" + item.name + "」？之后记新账时不会再出现。" : "恢复「" + item.name + "」？";
+      if (stopping && count.n) text += "过去的 " + count.n + " 笔可以留在这一类，或在下面调整到新类别。";
+      if (!window.confirm(text)) return;
+      save("income_category", { active: stopping ? 0 : 1 }, item.id).catch(showError);
+    });
+    return [item.name, item.active === 0 ? "已停用" : "在用", String(count.n), money(count.total), toggle];
+  });
+  root.appendChild(table(["类别", "状态", "笔数", "合计", ""], categoryRows));
+  if ((state.incomeCategories || []).length > 1) {
+    root.appendChild(el("p", "调整分类：左边是原类别，右边是新类别。", "hint"));
+    const moveForm = document.createElement("form");
+    moveForm.className = "grid";
+    const choices = state.incomeCategories.map((item) => [item.active === 0 ? item.name + "（已停用）" : item.name, String(item.id)]);
+    field(moveForm, "source_id", choices, "select");
+    field(moveForm, "target_id", choices, "select");
+    const moveButton = el("button", "调整历史收入");
+    moveButton.className = "primary";
+    moveForm.appendChild(moveButton);
+    moveForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const data = Object.fromEntries(new FormData(moveForm));
+      if (data.source_id === data.target_id) { showError(new Error("请选择另一个类别")); return; }
+      const source = state.incomeCategories.filter((item) => String(item.id) === data.source_id)[0];
+      const target = state.incomeCategories.filter((item) => String(item.id) === data.target_id)[0];
+      if (!window.confirm("把「" + source.name + "」的全部历史收入调整到「" + target.name + "」？")) return;
+      try { await save("income_category_move", { target_id: Number(data.target_id) }, Number(data.source_id)); }
+      catch (error) { showError(error); }
+    });
+    root.appendChild(moveForm);
+  }
 }
 function renderBudget() {
   const root = document.getElementById("budget");
@@ -529,6 +835,7 @@ function renderBudget() {
   year.value = String(new Date().getFullYear());
   const category = field(form, "category_id", [], "select");
   state.categories.forEach((item) => {
+    if (item.active === 0) return;
     const option = el("option", item.name);
     option.value = item.id;
     category.appendChild(option);
@@ -543,7 +850,8 @@ function renderBudget() {
     catch (error) { showError(error); }
   });
   root.appendChild(form);
-  const names = Object.fromEntries(state.categories.map((item) => [item.id, item.name]));
+  const names = {};
+  state.categories.forEach((item) => { names[item.id] = item.active === 0 ? item.name + "（已停用）" : item.name; });
   const spent = {};
   state.expenses.forEach((row) => {
     const key = row.occurred_on.slice(0, 4) + ":" + row.category_id;

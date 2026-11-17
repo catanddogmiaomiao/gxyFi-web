@@ -42,6 +42,7 @@ export function workbook(state) {
       row.name, row.kind, row.city, row.address, row.area_sqm, row.acquired_on, row.purchase_price, row.current_value, row.valued_on, row.mortgage_balance, row.monthly_rent, row.note,
     ])),
     sheet("支出", ["日期", "类别", "金额", "对象", "备注"], state.expenses.map((row) => [row.occurred_on, row.category, row.amount, row.payee, row.note])),
+    sheet("收入", ["日期", "类别", "金额", "对象", "备注"], (state.incomes || []).map((row) => [row.occurred_on, row.category, row.amount, row.payee, row.note])),
     sheet("预算", ["年份", "类别编号", "金额", "备注"], state.budgets.map((row) => [row.year, row.category_id, row.amount, row.note])),
     sheet("汇率", ["币种", "汇率", "来源", "时间"], state.fx.map((row) => [row.code, row.rate, row.source, row.quoted_at])),
     sheet("行情", ["市场", "代码", "名称", "价格", "昨收", "币种", "时间", "来源", "状态", "说明"], state.quotes.map((row) => [

@@ -210,9 +210,17 @@ export async function fetchOne(market, symbol, finnhubToken) {
 }
 
 export async function refreshUserQuotes(db, userId, finnhubToken) {
-  const holdings = (await db.prepare(
-    "SELECT market, symbol FROM holdings WHERE user_id=? AND market IN ('US','A','GOLD')",
-  ).bind(userId).all()).results;
+  let holdings;
+  try {
+    holdings = (await db.prepare(
+      "SELECT market, symbol FROM holdings WHERE user_id=? AND market IN ('US','A','GOLD') AND sell_price IS NULL",
+    ).bind(userId).all()).results;
+  } catch (error) {
+    if (!String(error && error.message || error).includes("no such column")) throw error;
+    holdings = (await db.prepare(
+      "SELECT market, symbol FROM holdings WHERE user_id=? AND market IN ('US','A','GOLD')",
+    ).bind(userId).all()).results;
+  }
   const seen = new Set();
   const quotes = [];
   for (const holding of holdings) {
